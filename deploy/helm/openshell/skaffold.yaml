@@ -127,6 +127,8 @@ deploy:
           supervisor.image.repository: '{{.IMAGE_REPO_openshell_supervisor}}'
           supervisor.image.tag: '{{.IMAGE_TAG_openshell_supervisor}}'
 profiles:
+  # Full HA test path: installs Envoy Gateway and layers both HA replicas and
+  # Gateway API routing values onto the OpenShell release.
   - name: high-availability
     patches:
       - op: add
