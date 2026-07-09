@@ -242,6 +242,7 @@ impl KubevirtComputeDriver {
         let memory_mib = self.config.memory_mib;
 
         let vm_spec = json!({
+            "spec": {
             "running": true,
             "template": {
                 "metadata": {
@@ -301,6 +302,7 @@ impl KubevirtComputeDriver {
                         },
                     ],
                 },
+            },
             },
         });
 
