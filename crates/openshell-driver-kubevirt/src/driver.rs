@@ -5,14 +5,13 @@
 //! resources on an OpenShift / Kubernetes cluster with KubeVirt installed.
 
 use crate::types::{vm_api_resource, vmi_api_resource};
-use base64::Engine;
 use futures::{Stream, StreamExt, TryStreamExt};
 use kube::api::{Api, DeleteParams, ListParams, PostParams};
 use kube::core::{DynamicObject, ObjectMeta};
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
 use openshell_core::driver_utils::{
-    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, SUPERVISOR_IMAGE_BINARY_PATH,
+    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID,
 };
 use openshell_core::proto::compute::v1::{
     DriverCondition, DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus,
@@ -49,6 +48,12 @@ pub struct KubevirtDriverConfig {
     pub vcpus: u32,
     /// Memory in MiB per VM.
     pub memory_mib: u32,
+    /// Path to OPA rego rules file for standalone (gateway-less) mode.
+    /// When set (along with `policy_data_path`), the driver embeds these
+    /// files in cloud-init so the supervisor can start without a gateway.
+    pub policy_rules_path: Option<String>,
+    /// Path to policy data YAML file for standalone mode.
+    pub policy_data_path: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -88,6 +93,10 @@ pub struct KubevirtComputeDriver {
     client: Client,
     watch_client: Client,
     config: KubevirtDriverConfig,
+    /// Pre-loaded OPA rules content for standalone (gateway-less) mode.
+    policy_rules_content: Option<String>,
+    /// Pre-loaded policy data YAML content for standalone mode.
+    policy_data_content: Option<String>,
 }
 
 impl std::fmt::Debug for KubevirtComputeDriver {
@@ -122,10 +131,41 @@ impl KubevirtComputeDriver {
         let watch_client =
             Client::try_from(watch_kube_config).map_err(KubevirtDriverError::from_kube)?;
 
+        // Pre-load standalone policy files if configured
+        let policy_rules_content = config
+            .policy_rules_path
+            .as_ref()
+            .map(|path| {
+                std::fs::read_to_string(path).map_err(|err| {
+                    KubevirtDriverError::Message(format!(
+                        "failed to read policy rules file {path}: {err}"
+                    ))
+                })
+            })
+            .transpose()?;
+
+        let policy_data_content = config
+            .policy_data_path
+            .as_ref()
+            .map(|path| {
+                std::fs::read_to_string(path).map_err(|err| {
+                    KubevirtDriverError::Message(format!(
+                        "failed to read policy data file {path}: {err}"
+                    ))
+                })
+            })
+            .transpose()?;
+
+        if policy_rules_content.is_some() && policy_data_content.is_some() {
+            info!("Standalone policy mode enabled — policy files will be embedded in cloud-init");
+        }
+
         Ok(Self {
             client,
             watch_client,
             config,
+            policy_rules_content,
+            policy_data_content,
         })
     }
 
@@ -234,9 +274,91 @@ impl KubevirtComputeDriver {
             }
         }
 
+        // Gather environment variables from the sandbox spec
+        let spec_env = sandbox
+            .spec
+            .as_ref()
+            .map(|s| &s.environment)
+            .cloned()
+            .unwrap_or_default();
+
+        let template_env = sandbox
+            .spec
+            .as_ref()
+            .and_then(|s| s.template.as_ref())
+            .map(|t| &t.environment)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut environment = spec_env;
+        environment.extend(template_env);
+
+        // Extract gateway endpoint and sandbox token from the spec
+        let gateway_endpoint = environment
+            .remove("OPENSHELL_ENDPOINT")
+            .unwrap_or_default();
+        let sandbox_token = sandbox
+            .spec
+            .as_ref()
+            .map(|s| s.sandbox_token.as_str())
+            .unwrap_or_default()
+            .to_string();
+
         // Build cloud-init userdata
-        let cloud_init = build_cloud_init_userdata(&sandbox.id, &self.config.log_level);
-        let cloud_init_b64 = base64::engine::general_purpose::STANDARD.encode(cloud_init.as_bytes());
+        let cloud_init = build_cloud_init_userdata(&CloudInitParams {
+            sandbox_id: &sandbox.id,
+            sandbox_name: name,
+            log_level: &self.config.log_level,
+            gateway_endpoint: &gateway_endpoint,
+            sandbox_token: &sandbox_token,
+            environment: &environment,
+            policy_rules_content: self.policy_rules_content.as_deref(),
+            policy_data_content: self.policy_data_content.as_deref(),
+        });
+
+        // KubeVirt limits inline cloudInitNoCloud userdata to 2048 bytes.
+        // Always create a Secret with the userdata and reference it via
+        // userDataSecretRef to avoid hitting that limit when policy files
+        // are embedded.
+        let secret_name = format!("{name}-cloudinit");
+        let secret_api: Api<k8s_openapi::api::core::v1::Secret> =
+            Api::namespaced(self.client.clone(), &self.config.namespace);
+
+        let secret = k8s_openapi::api::core::v1::Secret {
+            metadata: ObjectMeta {
+                name: Some(secret_name.clone()),
+                namespace: Some(self.config.namespace.clone()),
+                labels: Some(labels.clone()),
+                // Owner reference will be the VM — cleaned up when VM is deleted
+                ..Default::default()
+            },
+            string_data: Some(
+                [("userdata".to_string(), cloud_init)]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            secret_api.create(&PostParams::default(), &secret),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                debug!(secret = %secret_name, "Created cloud-init secret");
+            }
+            Ok(Err(err)) => {
+                warn!(error = %err, "Failed to create cloud-init secret");
+                return Err(KubevirtDriverError::from_kube(err));
+            }
+            Err(_elapsed) => {
+                return Err(KubevirtDriverError::Message(
+                    "timed out creating cloud-init secret".to_string(),
+                ));
+            }
+        }
 
         let vcpus = self.config.vcpus;
         let memory_mib = self.config.memory_mib;
@@ -297,7 +419,9 @@ impl KubevirtComputeDriver {
                         {
                             "name": "cloudinitdisk",
                             "cloudInitNoCloud": {
-                                "userDataBase64": cloud_init_b64,
+                                "secretRef": {
+                                    "name": secret_name,
+                                },
                             },
                         },
                     ],
@@ -387,6 +511,28 @@ impl KubevirtComputeDriver {
             namespace = %self.config.namespace,
             "Deleting KubeVirt VM"
         );
+
+        // Clean up the cloud-init secret (best-effort)
+        let secret_name = format!("{name}-cloudinit");
+        let secret_api: Api<k8s_openapi::api::core::v1::Secret> =
+            Api::namespaced(self.client.clone(), &self.config.namespace);
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            secret_api.delete(&secret_name, &DeleteParams::default()),
+        )
+        .await
+        {
+            Ok(Ok(_)) => debug!(secret = %secret_name, "Deleted cloud-init secret"),
+            Ok(Err(KubeError::Api(err))) if err.code == 404 => {
+                debug!(secret = %secret_name, "Cloud-init secret not found (already deleted)");
+            }
+            Ok(Err(err)) => {
+                warn!(secret = %secret_name, error = %err, "Failed to delete cloud-init secret");
+            }
+            Err(_) => {
+                warn!(secret = %secret_name, "Timed out deleting cloud-init secret");
+            }
+        }
 
         let vm_api = self.vm_api(self.client.clone());
         match tokio::time::timeout(
@@ -623,19 +769,162 @@ fn sandbox_from_vmi(namespace: &str, obj: DynamicObject) -> Result<Sandbox, Stri
     })
 }
 
+/// Parameters for building cloud-init userdata.
+struct CloudInitParams<'a> {
+    sandbox_id: &'a str,
+    sandbox_name: &'a str,
+    log_level: &'a str,
+    /// Gateway gRPC endpoint (e.g. `https://gateway.openshell.svc:8443`).
+    /// When empty, the supervisor runs in local/standalone mode.
+    gateway_endpoint: &'a str,
+    /// Per-sandbox JWT token issued by the gateway.
+    sandbox_token: &'a str,
+    /// Additional environment variables to inject into the supervisor.
+    environment: &'a std::collections::HashMap<String, String>,
+    /// OPA rego rules content for standalone mode.
+    policy_rules_content: Option<&'a str>,
+    /// Policy data YAML content for standalone mode.
+    policy_data_content: Option<&'a str>,
+}
+
 /// Build cloud-init userdata that configures the sandbox VM.
-fn build_cloud_init_userdata(sandbox_id: &str, log_level: &str) -> String {
+///
+/// The userdata:
+/// 1. Writes the sandbox identity and credentials to well-known paths.
+/// 2. Configures SSH on the sandbox port.
+/// 3. Starts the openshell-sandbox supervisor as a systemd service so it
+///    survives cloud-init and can be monitored/restarted.
+fn build_cloud_init_userdata(params: &CloudInitParams<'_>) -> String {
+    use openshell_core::driver_utils::{
+        SANDBOX_TOKEN_MOUNT_PATH, SUPERVISOR_CONTAINER_BINARY,
+    };
+
+    let CloudInitParams {
+        sandbox_id,
+        sandbox_name,
+        log_level,
+        gateway_endpoint,
+        sandbox_token,
+        environment,
+        policy_rules_content,
+        policy_data_content,
+    } = params;
+
+    // Build the Environment= lines for the systemd unit
+    let mut env_lines = Vec::new();
+    env_lines.push(format!("Environment=OPENSHELL_SANDBOX_ID={sandbox_id}"));
+    env_lines.push(format!("Environment=OPENSHELL_SANDBOX={sandbox_name}"));
+    env_lines.push(format!("Environment=OPENSHELL_LOG_LEVEL={log_level}"));
+    env_lines.push(format!(
+        "Environment=OPENSHELL_SSH_SOCKET_PATH=/run/openshell/ssh.sock"
+    ));
+    env_lines.push(format!("Environment=OPENSHELL_SANDBOX_UID=10001"));
+    env_lines.push(format!("Environment=OPENSHELL_SANDBOX_GID=10001"));
+
+    if !gateway_endpoint.is_empty() {
+        env_lines.push(format!(
+            "Environment=OPENSHELL_ENDPOINT={gateway_endpoint}"
+        ));
+    }
+    if !sandbox_token.is_empty() {
+        env_lines.push(format!(
+            "Environment=OPENSHELL_SANDBOX_TOKEN_FILE={SANDBOX_TOKEN_MOUNT_PATH}"
+        ));
+    }
+
+    // Standalone policy mode: point the supervisor at embedded policy files
+    let has_standalone_policy = policy_rules_content.is_some() && policy_data_content.is_some();
+    if has_standalone_policy {
+        env_lines.push(format!(
+            "Environment=OPENSHELL_POLICY_RULES=/etc/openshell/policy/rules.rego"
+        ));
+        env_lines.push(format!(
+            "Environment=OPENSHELL_POLICY_DATA=/etc/openshell/policy/data.yaml"
+        ));
+    }
+
+    // Propagate extra environment variables from the sandbox spec
+    for (k, v) in environment.iter() {
+        env_lines.push(format!("Environment={k}={v}"));
+    }
+
+    let env_block = env_lines.join("\n      ");
+
+    // Build write_files entries for credentials
+    let mut write_files = String::new();
+    write_files.push_str(&format!(
+        r#"  - path: /etc/openshell/sandbox-id
+    content: "{sandbox_id}"
+    permissions: "0644"
+"#
+    ));
+
+    if !sandbox_token.is_empty() {
+        write_files.push_str(&format!(
+            r#"  - path: {SANDBOX_TOKEN_MOUNT_PATH}
+    content: "{sandbox_token}"
+    permissions: "0400"
+"#
+        ));
+    }
+
+    // Embed standalone policy files
+    if let (Some(rules), Some(data)) = (policy_rules_content, policy_data_content) {
+        // Indent the rego content for YAML block scalar
+        let rules_indented: String = rules
+            .lines()
+            .map(|line| format!("      {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_files.push_str(&format!(
+            r#"  - path: /etc/openshell/policy/rules.rego
+    permissions: "0644"
+    content: |
+{rules_indented}
+"#
+        ));
+
+        let data_indented: String = data
+            .lines()
+            .map(|line| format!("      {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_files.push_str(&format!(
+            r#"  - path: /etc/openshell/policy/data.yaml
+    permissions: "0644"
+    content: |
+{data_indented}
+"#
+        ));
+    }
+
     format!(
         r#"#cloud-config
 users:
   - name: sandbox
+    uid: "10001"
     shell: /bin/bash
     sudo: ALL=(ALL) NOPASSWD:ALL
 
 write_files:
-  - path: /etc/openshell/sandbox-id
-    content: "{sandbox_id}"
+{write_files}
+  - path: /etc/systemd/system/openshell-sandbox.service
     permissions: "0644"
+    content: |
+      [Unit]
+      Description=OpenShell Sandbox Supervisor
+      After=network-online.target sshd.service
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      ExecStart={SUPERVISOR_CONTAINER_BINARY}
+      Restart=on-failure
+      RestartSec=5
+      {env_block}
+
+      [Install]
+      WantedBy=multi-user.target
 
 runcmd:
   - |
@@ -643,10 +932,12 @@ runcmd:
     sed -i 's/^#\?Port .*/Port {SANDBOX_SSH_PORT}/' /etc/ssh/sshd_config
     systemctl restart sshd || true
   - |
-    # Start the openshell-sandbox supervisor if present
-    if [ -x "{SUPERVISOR_IMAGE_BINARY_PATH}" ]; then
-      OPENSHELL_LOG_LEVEL="{log_level}" {SUPERVISOR_IMAGE_BINARY_PATH} &
-    fi
+    # Ensure run directory exists
+    mkdir -p /run/openshell
+  - |
+    # Enable and start the supervisor
+    systemctl daemon-reload
+    systemctl enable --now openshell-sandbox.service
 "#
     )
 }

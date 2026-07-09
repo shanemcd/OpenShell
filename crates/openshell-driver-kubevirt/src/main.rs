@@ -68,6 +68,18 @@ struct Args {
         default_value_t = 2048
     )]
     memory_mib: u32,
+
+    /// Path to OPA rego rules file for standalone (gateway-less) mode.
+    /// When set with --policy-data, the driver embeds these files in
+    /// cloud-init so the supervisor can start without a gateway.
+    #[arg(long, env = "OPENSHELL_POLICY_RULES")]
+    policy_rules: Option<String>,
+
+    /// Path to policy data YAML file for standalone mode.
+    /// When set with --policy-rules, the driver embeds these files in
+    /// cloud-init so the supervisor can start without a gateway.
+    #[arg(long, env = "OPENSHELL_POLICY_DATA")]
+    policy_data: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +137,8 @@ async fn main() -> Result<()> {
         log_level: args.log_level.clone(),
         vcpus: args.vcpus,
         memory_mib: args.memory_mib,
+        policy_rules_path: args.policy_rules,
+        policy_data_path: args.policy_data,
     })
     .await
     .into_diagnostic()?;
