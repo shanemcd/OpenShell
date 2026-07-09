@@ -3695,6 +3695,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-driver-kubevirt"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "futures",
+ "k8s-openapi",
+ "kube",
+ "kube-runtime",
+ "miette",
+ "openshell-core",
+ "prost",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "openshell-driver-podman"
 version = "0.0.0"
 dependencies = [
