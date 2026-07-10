@@ -203,3 +203,7 @@ rfc.md
 
 # Bazel convenience symlinks
 bazel-*
+
+# Nix
+/result
+/result-*
