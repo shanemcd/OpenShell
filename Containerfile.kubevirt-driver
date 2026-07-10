@@ -1,0 +1,4 @@
+FROM registry.fedoraproject.org/fedora-minimal:42
+RUN microdnf install -y z3-libs && microdnf clean all
+COPY target/release/openshell-driver-kubevirt /usr/local/bin/openshell-driver-kubevirt
+ENTRYPOINT ["/usr/local/bin/openshell-driver-kubevirt"]

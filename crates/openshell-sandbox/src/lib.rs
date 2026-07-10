@@ -12,6 +12,8 @@ mod google_cloud_metadata;
 mod mechanistic_mapper;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod metadata_server;
+#[cfg(target_os = "linux")]
+mod sidecar_runtime;
 
 use miette::Result;
 use std::future::Future;
@@ -505,9 +507,23 @@ pub async fn run_sandbox(
         )
         .await?
     } else {
-        // Network-only sidecar mode: keep the proxy and its background
-        // tasks alive (held via the `networking` value) until SIGINT or
-        // SIGTERM. Exit 0 on clean shutdown.
+        // Network-only sidecar mode: publish coordination files for a sibling
+        // workload, adopt its entrypoint PID for proxy identity binding, and
+        // keep the proxy alive until SIGINT/SIGTERM.
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(ns) = netns.as_ref() {
+                if let Err(err) =
+                    sidecar_runtime::publish_sidecar_runtime_files(ns.name(), &provider_env)
+                {
+                    warn!(
+                        error = %err,
+                        "Failed to publish sidecar runtime files; sibling workload may not start"
+                    );
+                }
+            }
+            sidecar_runtime::spawn_external_entrypoint_watcher(entrypoint_pid.clone());
+        }
         wait_for_shutdown_signal().await;
         0
     };
@@ -2065,6 +2081,31 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                         env_result.dynamic_credentials,
                     );
                     current_provider_env_revision = env_result.provider_env_revision;
+                    #[cfg(target_os = "linux")]
+                    {
+                        // Keep sidecar provider.env in sync when credentials rotate.
+                        let refreshed = ctx.provider_credentials.child_env_with_gcp_resolved();
+                        if let Ok(netns_path) =
+                            std::fs::read_to_string(sidecar_runtime::NETNS_PATH_FILE)
+                        {
+                            let netns_name = netns_path
+                                .trim()
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or_default();
+                            if !netns_name.is_empty()
+                                && let Err(err) = sidecar_runtime::publish_sidecar_runtime_files(
+                                    netns_name,
+                                    &refreshed,
+                                )
+                            {
+                                warn!(
+                                    error = %err,
+                                    "Failed to refresh sidecar provider.env after credential update"
+                                );
+                            }
+                        }
+                    }
                     ocsf_emit!(
                         ConfigStateChangeBuilder::new(ocsf_ctx())
                             .severity(SeverityId::Informational)
