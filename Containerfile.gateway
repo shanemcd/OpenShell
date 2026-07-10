@@ -1,0 +1,2 @@
+FROM ghcr.io/nvidia/openshell/gateway:latest
+COPY target/release/openshell-gateway /usr/local/bin/openshell-gateway

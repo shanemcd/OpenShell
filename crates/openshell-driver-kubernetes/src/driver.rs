@@ -798,6 +798,12 @@ impl KubernetesComputeDriver {
         let (resolved_user_id, resolved_group_id, ns_annotations) =
             self.resolve_sandbox_identity().await;
 
+        let sandbox_token = sandbox
+            .spec
+            .as_ref()
+            .map(|s| s.sandbox_token.as_str())
+            .unwrap_or_default();
+
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
             image_pull_policy: &self.config.image_pull_policy,
@@ -829,6 +835,9 @@ impl KubernetesComputeDriver {
                 .provider_spiffe_workload_api_socket_path,
             sandbox_uid: resolved_user_id,
             sandbox_gid: resolved_group_id,
+            runtime_backend: &self.config.runtime_backend,
+            sandbox_token,
+            sandbox_command: &self.config.sandbox_command,
         };
         validate_sidecar_proxy_identity(&params)?;
 
@@ -2080,6 +2089,13 @@ struct SandboxPodParams<'a> {
     sandbox_uid: u32,
     /// Resolved sandbox GID for PVC init container operations.
     sandbox_gid: u32,
+    /// Runtime backend: empty or "Pod" for pods, "VirtualMachine" for KubeVirt VMs.
+    runtime_backend: &'a str,
+    /// Gateway-minted sandbox JWT. Injected directly as env var for VM
+    /// sandboxes (which cannot use projected SA token bootstrap).
+    sandbox_token: &'a str,
+    /// Default command for VM sandboxes.
+    sandbox_command: &'a str,
 }
 
 impl Default for SandboxPodParams<'_> {
@@ -2110,6 +2126,9 @@ impl Default for SandboxPodParams<'_> {
             provider_spiffe_workload_api_socket_path: "",
             sandbox_uid: DEFAULT_SANDBOX_UID,
             sandbox_gid: DEFAULT_SANDBOX_UID,
+            runtime_backend: "",
+            sandbox_token: "",
+            sandbox_command: "",
         }
     }
 }
@@ -2163,8 +2182,12 @@ fn sandbox_to_k8s_spec(
     spec: Option<&SandboxSpec>,
     params: &SandboxPodParams<'_>,
 ) -> Result<serde_json::Value, String> {
+    if params.runtime_backend.eq_ignore_ascii_case("VirtualMachine") {
+        return Ok(sandbox_to_k8s_spec_vm(spec, params));
+    }
+
     let driver_config =
-        kubernetes_driver_config_for_spec(spec, provider_spiffe_socket_path(params))?;
+        validated_driver_config_for_spec(spec, provider_spiffe_socket_path(params))?;
     let mut root = serde_json::Map::new();
 
     // Determine early whether OpenShell should inject its default workspace
@@ -2224,6 +2247,66 @@ fn sandbox_to_k8s_spec(
     Ok(serde_json::Value::Object(
         std::iter::once(("spec".to_string(), serde_json::Value::Object(root))).collect(),
     ))
+}
+
+/// Build a Sandbox CR spec for the VirtualMachine runtime backend.
+///
+/// The agent-sandbox controller uses `containers[0].image` as the containerDisk
+/// and passes all container env vars into the VM via cloud-init. No supervisor
+/// sideload, projected SA tokens, or workspace PVCs are needed — the VM image
+/// has the supervisor baked in and cloud-init handles bootstrap.
+fn sandbox_to_k8s_spec_vm(
+    spec: Option<&SandboxSpec>,
+    params: &SandboxPodParams<'_>,
+) -> serde_json::Value {
+    let image = spec
+        .and_then(|s| s.template.as_ref())
+        .map(|t| t.image.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(params.default_image);
+
+    let mut env = Vec::new();
+    upsert_env(&mut env, openshell_core::sandbox_env::SANDBOX_ID, params.sandbox_id);
+    upsert_env(&mut env, openshell_core::sandbox_env::SANDBOX, params.sandbox_name);
+    upsert_env(&mut env, openshell_core::sandbox_env::ENDPOINT, params.grpc_endpoint);
+
+    if !params.sandbox_token.is_empty() {
+        upsert_env(&mut env, openshell_core::sandbox_env::SANDBOX_TOKEN, params.sandbox_token);
+    }
+
+    if !params.sandbox_command.is_empty() {
+        upsert_env(&mut env, "OPENSHELL_SANDBOX_COMMAND", params.sandbox_command);
+    }
+
+    // Forward user-specified environment variables from the spec.
+    if let Some(spec) = spec {
+        for (key, value) in &spec.environment {
+            upsert_env(&mut env, key, value);
+        }
+    }
+
+    let pod_template = serde_json::json!({
+        "metadata": {
+            "annotations": {
+                "openshell.io/sandbox-id": params.sandbox_id
+            }
+        },
+        "spec": {
+            "containers": [{
+                "name": "sandbox",
+                "image": image,
+                "env": env
+            }]
+        }
+    });
+
+    let mut root = serde_json::Map::new();
+    root.insert("runtimeBackend".to_string(), serde_json::json!("VirtualMachine"));
+    root.insert("podTemplate".to_string(), pod_template);
+
+    serde_json::Value::Object(
+        std::iter::once(("spec".to_string(), serde_json::Value::Object(root))).collect(),
+    )
 }
 
 #[cfg(test)]

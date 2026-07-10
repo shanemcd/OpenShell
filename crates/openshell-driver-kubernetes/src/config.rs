@@ -288,6 +288,19 @@ pub struct KubernetesComputeConfig {
         deserialize_with = "deserialize_provider_spiffe_workload_api_socket_path"
     )]
     pub provider_spiffe_workload_api_socket_path: String,
+    /// Runtime backend for sandbox workloads. When set to `"VirtualMachine"`,
+    /// the driver emits `runtimeBackend: VirtualMachine` on the Sandbox CR so
+    /// the agent-sandbox controller creates a KubeVirt VM instead of a Pod.
+    /// The gateway-minted sandbox token is injected directly as an env var
+    /// (VMs cannot use projected ServiceAccount token bootstrap). Empty or
+    /// `"Pod"` (default) keeps the existing Pod-based path.
+    #[serde(default)]
+    pub runtime_backend: String,
+    /// Default command for VM sandboxes. Injected as
+    /// `OPENSHELL_SANDBOX_COMMAND` so the supervisor runs this instead of
+    /// `/bin/bash`. Only used when `runtime_backend` is `VirtualMachine`.
+    #[serde(default)]
+    pub sandbox_command: String,
     /// UID used for privilege-drop operations and workspace init container
     /// ownership. The supervisor container always runs as UID 0 (root) to
     /// create network namespaces and configure Landlock/seccomp; the
@@ -349,6 +362,8 @@ impl Default for KubernetesComputeConfig {
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
             default_runtime_class_name: String::new(),
             sa_token_ttl_secs: 3600,
+            runtime_backend: String::new(),
+            sandbox_command: String::new(),
             provider_spiffe_workload_api_socket_path: String::new(),
             sandbox_uid: None,
             sandbox_gid: None,
@@ -368,6 +383,11 @@ impl KubernetesComputeConfig {
             self.sa_token_ttl_secs
                 .clamp(MIN_SA_TOKEN_TTL_SECS, MAX_SA_TOKEN_TTL_SECS)
         }
+    }
+
+    #[must_use]
+    pub fn is_vm_backend(&self) -> bool {
+        self.runtime_backend.eq_ignore_ascii_case("VirtualMachine")
     }
 
     #[must_use]
