@@ -1995,6 +1995,9 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
         "containercreated",
         "healthcheckstarting",
         "inspectfailed",
+        "pending",
+        "scheduling",
+        "unschedulable",
     ];
     !transient_reasons.contains(&reason.as_str())
 }

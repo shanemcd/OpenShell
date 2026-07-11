@@ -114,3 +114,11 @@ pub const SANDBOX_UID: &str = "OPENSHELL_SANDBOX_UID";
 /// Used alongside UID for PVC init container `chown` operations and when the
 /// supervisor drops privileges to a group other than the UID's primary group.
 pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";
+
+/// When set to `"1"`, skip the recursive `/sandbox` chown that normally runs
+/// when [`SANDBOX_UID`] is injected.
+///
+/// Used by KubeVirt / NemoClaw VMs that bake a mixed-ownership seal layout
+/// (`root:root` trust anchors under `/sandbox/.hermes`, `root:sandbox` sticky
+/// `/sandbox`). Recursive chown to the sandbox UID would destroy that posture.
+pub const PRESERVE_SANDBOX_OWNERSHIP: &str = "OPENSHELL_PRESERVE_SANDBOX_OWNERSHIP";

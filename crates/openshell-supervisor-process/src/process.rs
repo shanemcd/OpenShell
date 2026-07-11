@@ -1264,16 +1264,57 @@ pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
     // /sandbox home directory may already exist with image-default ownership
     // (e.g. UID 1000) that differs from the driver-assigned identity.
     // Recursively chown /sandbox so the sandbox process can use its home
-    // directory.
-    if std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok() {
-        let sandbox_home = Path::new("/sandbox");
-        if sandbox_home.exists() {
-            info!(?uid, ?gid, "Chowning /sandbox for driver-injected UID/GID");
-            chown_sandbox_home(sandbox_home, uid, gid)?;
-        }
-    }
+    // directory — unless OPENSHELL_PRESERVE_SANDBOX_OWNERSHIP=1 opts out
+    // (NemoClaw/KubeVirt sealed layouts keep root-owned trust anchors).
+    maybe_chown_sandbox_home(Path::new("/sandbox"), uid, gid)?;
 
     Ok(())
+}
+
+/// Whether `prepare_filesystem` should recursively chown `/sandbox`.
+///
+/// Requires [`openshell_core::sandbox_env::SANDBOX_UID`]. Skipped when
+/// [`openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP`] is `"1"`.
+#[cfg(unix)]
+fn should_recursively_chown_sandbox_home() -> bool {
+    if std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_err() {
+        return false;
+    }
+    match std::env::var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP) {
+        Ok(v) if v == "1" => false,
+        _ => true,
+    }
+}
+
+/// Recursively chown `sandbox_home` for driver-injected UID/GID, unless
+/// ownership preservation is requested.
+#[cfg(unix)]
+fn maybe_chown_sandbox_home(
+    sandbox_home: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+) -> Result<()> {
+    if !should_recursively_chown_sandbox_home() {
+        if std::env::var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP).as_deref()
+            == Ok("1")
+        {
+            info!(
+                path = %sandbox_home.display(),
+                "Preserving sandbox ownership (OPENSHELL_PRESERVE_SANDBOX_OWNERSHIP=1)"
+            );
+        }
+        return Ok(());
+    }
+    if !sandbox_home.exists() {
+        return Ok(());
+    }
+    info!(
+        path = %sandbox_home.display(),
+        ?uid,
+        ?gid,
+        "Chowning sandbox home for driver-injected UID/GID"
+    );
+    chown_sandbox_home(sandbox_home, uid, gid)
 }
 
 #[cfg(not(unix))]
@@ -2113,6 +2154,109 @@ mod tests {
             Some(nix::unistd::getegid()),
         )
         .expect("should skip symlink children without error");
+    }
+
+    /// Serialize env mutations across preserve-ownership tests.
+    #[cfg(unix)]
+    static PRESERVE_OWNERSHIP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    fn with_sandbox_uid_env<F: FnOnce()>(preserve: Option<&str>, f: F) {
+        let _guard = PRESERVE_OWNERSHIP_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialized by PRESERVE_OWNERSHIP_ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var(openshell_core::sandbox_env::SANDBOX_UID, "10001");
+            match preserve {
+                Some(v) => std::env::set_var(
+                    openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP,
+                    v,
+                ),
+                None => std::env::remove_var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP),
+            }
+        }
+        f();
+        unsafe {
+            std::env::remove_var(openshell_core::sandbox_env::SANDBOX_UID);
+            std::env::remove_var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_recursively_chown_sandbox_home_respects_preserve_flag() {
+        with_sandbox_uid_env(None, || {
+            assert!(should_recursively_chown_sandbox_home());
+        });
+        with_sandbox_uid_env(Some("1"), || {
+            assert!(!should_recursively_chown_sandbox_home());
+        });
+        with_sandbox_uid_env(Some("0"), || {
+            assert!(should_recursively_chown_sandbox_home());
+        });
+        let _guard = PRESERVE_OWNERSHIP_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var(openshell_core::sandbox_env::SANDBOX_UID);
+            std::env::remove_var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP);
+        }
+        assert!(!should_recursively_chown_sandbox_home());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn maybe_chown_sandbox_home_preserves_root_owned_seal_when_flag_set() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+        let sealed = root.join("config.yaml");
+        std::fs::write(&sealed, "sealed").unwrap();
+
+        let before_uid = std::fs::metadata(&sealed).unwrap().uid();
+        let before_gid = std::fs::metadata(&sealed).unwrap().gid();
+
+        with_sandbox_uid_env(Some("1"), || {
+            maybe_chown_sandbox_home(
+                &root,
+                Some(Uid::from_raw(10001)),
+                Some(Gid::from_raw(10001)),
+            )
+            .unwrap();
+        });
+
+        let after = std::fs::metadata(&sealed).unwrap();
+        assert_eq!(after.uid(), before_uid, "sealed file uid must be preserved");
+        assert_eq!(after.gid(), before_gid, "sealed file gid must be preserved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn maybe_chown_sandbox_home_chowns_when_preserve_unset() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Only meaningful when the test process can chown to its own euid/egid.
+        let expected_uid = nix::unistd::geteuid();
+        let expected_gid = nix::unistd::getegid();
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+        let sealed = root.join("config.yaml");
+        std::fs::write(&sealed, "sealed").unwrap();
+
+        with_sandbox_uid_env(None, || {
+            maybe_chown_sandbox_home(&root, Some(expected_uid), Some(expected_gid)).unwrap();
+        });
+
+        let after = std::fs::metadata(&sealed).unwrap();
+        assert_eq!(after.uid(), expected_uid.as_raw());
+        assert_eq!(after.gid(), expected_gid.as_raw());
     }
 
     #[cfg(unix)]

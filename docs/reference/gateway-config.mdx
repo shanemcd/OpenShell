@@ -190,6 +190,9 @@ host_gateway_ip                = "10.0.0.1"
 enable_user_namespaces         = false
 app_armor_profile              = "Unconfined"
 workspace_default_storage_size = "10Gi"
+# When true (default), new sandboxes get a workspace PVC at /sandbox for both
+# Pod and VirtualMachine backends. Set false to omit volumeClaimTemplates.
+workspace_persistence          = true
 # Kubernetes RuntimeClass applied to sandbox pods when the API request does
 # not specify one. Empty (default) = omit the field, using the cluster default.
 # default_runtime_class_name   = "kata-containers"

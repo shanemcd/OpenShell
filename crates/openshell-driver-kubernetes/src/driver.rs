@@ -827,6 +827,7 @@ impl KubernetesComputeDriver {
             enable_user_namespaces: self.config.enable_user_namespaces,
             app_armor_profile: self.config.app_armor_profile.as_ref(),
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
+            workspace_persistence: self.config.workspace_persistence,
             default_runtime_class_name: &self.config.default_runtime_class_name,
             sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
             provider_spiffe_enabled: self.config.provider_spiffe_enabled(),
@@ -2079,6 +2080,8 @@ struct SandboxPodParams<'a> {
     enable_user_namespaces: bool,
     app_armor_profile: Option<&'a AppArmorProfile>,
     workspace_default_storage_size: &'a str,
+    /// When true, emit a workspace PVC + `/sandbox` mount (Pod and VM).
+    workspace_persistence: bool,
     default_runtime_class_name: &'a str,
     /// Lifetime (seconds) of the projected `ServiceAccount` token used
     /// for the bootstrap `IssueSandboxToken` exchange.
@@ -2120,6 +2123,7 @@ impl Default for SandboxPodParams<'_> {
             enable_user_namespaces: false,
             app_armor_profile: None,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
+            workspace_persistence: true,
             default_runtime_class_name: "",
             sa_token_ttl_secs: 3600,
             provider_spiffe_enabled: false,
@@ -2192,11 +2196,12 @@ fn sandbox_to_k8s_spec(
 
     // Determine early whether OpenShell should inject its default workspace
     // PVC. Explicit Kubernetes driver-config mounts under /sandbox/ take
-    // ownership of workspace persistence.
+    // ownership of workspace persistence. The config flag can disable injection.
     // We need this flag before building the podTemplate because the workspace
     // persistence transforms are applied inside sandbox_template_to_k8s.
     let user_has_explicit_workspace_mount = driver_config.has_explicit_sandbox_data_mount();
-    let inject_workspace = !user_has_explicit_workspace_mount;
+    let inject_workspace =
+        params.workspace_persistence && !user_has_explicit_workspace_mount;
 
     if let Some(spec) = spec {
         let pod_env = spec_pod_env(Some(spec));
@@ -2253,8 +2258,10 @@ fn sandbox_to_k8s_spec(
 ///
 /// The agent-sandbox controller uses `containers[0].image` as the containerDisk
 /// and passes all container env vars into the VM via cloud-init. No supervisor
-/// sideload, projected SA tokens, or workspace PVCs are needed — the VM image
-/// has the supervisor baked in and cloud-init handles bootstrap.
+/// sideload or projected SA tokens are needed — the VM image has the supervisor
+/// baked in and cloud-init handles bootstrap. When `workspace_persistence` is
+/// enabled, a workspace PVC is attached the same way as for Pods; the guest
+/// prepare script (agent-sandbox) formats, mounts, and seeds `/sandbox`.
 fn sandbox_to_k8s_spec_vm(
     spec: Option<&SandboxSpec>,
     params: &SandboxPodParams<'_>,
@@ -2285,6 +2292,18 @@ fn sandbox_to_k8s_spec_vm(
         }
     }
 
+    let mut container = serde_json::json!({
+        "name": "sandbox",
+        "image": image,
+        "env": env
+    });
+    if params.workspace_persistence {
+        container["volumeMounts"] = serde_json::json!([{
+            "name": WORKSPACE_VOLUME_NAME,
+            "mountPath": WORKSPACE_MOUNT_PATH
+        }]);
+    }
+
     let pod_template = serde_json::json!({
         "metadata": {
             "annotations": {
@@ -2292,17 +2311,19 @@ fn sandbox_to_k8s_spec_vm(
             }
         },
         "spec": {
-            "containers": [{
-                "name": "sandbox",
-                "image": image,
-                "env": env
-            }]
+            "containers": [container]
         }
     });
 
     let mut root = serde_json::Map::new();
     root.insert("runtimeBackend".to_string(), serde_json::json!("VirtualMachine"));
     root.insert("podTemplate".to_string(), pod_template);
+    if params.workspace_persistence {
+        root.insert(
+            "volumeClaimTemplates".to_string(),
+            default_workspace_volume_claim_templates(params.workspace_default_storage_size),
+        );
+    }
 
     serde_json::Value::Object(
         std::iter::once(("spec".to_string(), serde_json::Value::Object(root))).collect(),
@@ -5707,5 +5728,85 @@ mod tests {
         let vct = default_workspace_volume_claim_templates("");
         let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
         assert_eq!(storage, DEFAULT_WORKSPACE_STORAGE_SIZE);
+    }
+
+    #[test]
+    fn vm_spec_includes_workspace_pvc_when_persistence_enabled() {
+        let params = SandboxPodParams {
+            runtime_backend: "VirtualMachine",
+            default_image: "registry.example/hermes:latest",
+            workspace_persistence: true,
+            workspace_default_storage_size: "10Gi",
+            sandbox_command: "/usr/local/bin/nemoclaw-start-vm",
+            ..SandboxPodParams::default()
+        };
+        let cr = sandbox_to_k8s_spec(None, &params);
+        assert_eq!(cr["spec"]["runtimeBackend"], "VirtualMachine");
+        assert_eq!(
+            cr["spec"]["volumeClaimTemplates"][0]["metadata"]["name"],
+            WORKSPACE_VOLUME_NAME
+        );
+        assert_eq!(
+            cr["spec"]["volumeClaimTemplates"][0]["spec"]["resources"]["requests"]["storage"],
+            "10Gi"
+        );
+        let mounts = cr["spec"]["podTemplate"]["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts");
+        assert!(mounts.iter().any(|m| {
+            m["name"] == WORKSPACE_VOLUME_NAME && m["mountPath"] == WORKSPACE_MOUNT_PATH
+        }));
+        // VMs must not get the Pod workspace-init container.
+        assert!(cr["spec"]["podTemplate"]["spec"]
+            .get("initContainers")
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true));
+    }
+
+    #[test]
+    fn vm_spec_omits_workspace_pvc_when_persistence_disabled() {
+        let params = SandboxPodParams {
+            runtime_backend: "VirtualMachine",
+            workspace_persistence: false,
+            ..SandboxPodParams::default()
+        };
+        let cr = sandbox_to_k8s_spec(None, &params);
+        assert!(cr["spec"].get("volumeClaimTemplates").is_none());
+        assert!(cr["spec"]["podTemplate"]["spec"]["containers"][0]
+            .get("volumeMounts")
+            .is_none());
+    }
+
+    #[test]
+    fn pod_spec_omits_workspace_pvc_when_persistence_disabled() {
+        let params = SandboxPodParams {
+            workspace_persistence: false,
+            ..SandboxPodParams::default()
+        };
+        let cr = sandbox_to_k8s_spec(None, &params);
+        assert!(cr["spec"].get("volumeClaimTemplates").is_none());
+        assert!(
+            !cr["spec"]["podTemplate"]["spec"]["containers"][0]["volumeMounts"]
+                .as_array()
+                .is_some_and(|mounts| mounts.iter().any(|m| m["name"] == WORKSPACE_VOLUME_NAME)),
+            "workspace mount must be absent when persistence is disabled"
+        );
+    }
+
+    #[test]
+    fn pod_spec_includes_workspace_pvc_when_persistence_enabled() {
+        let cr = sandbox_to_k8s_spec(None, &SandboxPodParams::default());
+        assert_eq!(
+            cr["spec"]["volumeClaimTemplates"][0]["metadata"]["name"],
+            WORKSPACE_VOLUME_NAME
+        );
+        assert!(
+            cr["spec"]["podTemplate"]["spec"]["containers"][0]["volumeMounts"]
+                .as_array()
+                .is_some_and(|mounts| mounts.iter().any(|m| {
+                    m["name"] == WORKSPACE_VOLUME_NAME && m["mountPath"] == WORKSPACE_MOUNT_PATH
+                }))
+        );
     }
 }

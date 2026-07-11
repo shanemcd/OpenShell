@@ -169,6 +169,13 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| {
             openshell_driver_kubernetes::DEFAULT_WORKSPACE_STORAGE_SIZE.to_string()
         }),
+        workspace_persistence: match std::env::var("OPENSHELL_K8S_WORKSPACE_PERSISTENCE") {
+            Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                "0" | "false" | "no" | "off" => false,
+                _ => true,
+            },
+            Err(_) => true,
+        },
         default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
             .unwrap_or_default(),
         runtime_backend: args.runtime_backend.unwrap_or_default(),

@@ -18,6 +18,10 @@ pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 /// Default non-root UID for relaxed Kubernetes network supervisor sidecars.
 pub const DEFAULT_PROXY_UID: u32 = 1337;
 
+fn default_true() -> bool {
+    true
+}
+
 /// How the supervisor binary is delivered into sandbox pods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -267,6 +271,11 @@ pub struct KubernetesComputeConfig {
     )]
     pub app_armor_profile: Option<AppArmorProfile>,
     pub workspace_default_storage_size: String,
+    /// When true (default), new sandboxes get a `workspace` PVC mounted at
+    /// `/sandbox` for both Pod and VirtualMachine backends. Set false to
+    /// omit `volumeClaimTemplates` and the workspace mount.
+    #[serde(default = "default_true")]
+    pub workspace_persistence: bool,
     /// Default Kubernetes `runtimeClassName` for sandbox pods.
     /// Applied when a `CreateSandbox` request does not specify one.
     /// Empty string (default) = omit the field, using the cluster default.
@@ -360,6 +369,7 @@ impl Default for KubernetesComputeConfig {
             enable_user_namespaces: false,
             app_armor_profile: None,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
+            workspace_persistence: true,
             default_runtime_class_name: String::new(),
             sa_token_ttl_secs: 3600,
             runtime_backend: String::new(),
@@ -658,6 +668,18 @@ mod tests {
         });
         let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
         assert!(err.to_string().contains("unknown field"));
+    fn default_workspace_persistence_is_enabled() {
+        let cfg = KubernetesComputeConfig::default();
+        assert!(cfg.workspace_persistence);
+        let cfg: KubernetesComputeConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.workspace_persistence);
+    }
+
+    #[test]
+    fn serde_override_workspace_persistence_false() {
+        let cfg: KubernetesComputeConfig =
+            serde_json::from_str(r#"{"workspace_persistence": false}"#).unwrap();
+        assert!(!cfg.workspace_persistence);
     }
 
     #[test]

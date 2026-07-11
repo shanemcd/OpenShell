@@ -183,10 +183,13 @@ server:
   # -- Image pull secrets attached to sandbox pods. Referenced Secrets must exist
   # in the sandbox namespace.
   sandboxImagePullSecrets: []
-  # -- Default storage size for the workspace PVC in sandbox pods.
+  # -- Default storage size for the workspace PVC in sandbox pods and VMs.
   # Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi").
   # Empty = built-in default (2Gi).
   workspaceDefaultStorageSize: ""
+  # -- When true (default), new sandboxes get a workspace PVC mounted at /sandbox
+  # for both Pod and VirtualMachine backends. Set false to omit the claim.
+  workspacePersistence: true
   # -- Default Kubernetes runtimeClassName for sandbox pods.
   # Applied when a CreateSandbox request does not specify one.
   # Empty (default) = omit the field, using the cluster's default RuntimeClass.

@@ -145,6 +145,13 @@ fn apply_kubernetes_runtime_defaults(k8s: &mut KubernetesComputeConfig) {
     if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
         k8s.workspace_default_storage_size = size;
     }
+    if let Ok(raw) = std::env::var("OPENSHELL_K8S_WORKSPACE_PERSISTENCE") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => k8s.workspace_persistence = true,
+            "0" | "false" | "no" | "off" => k8s.workspace_persistence = false,
+            _ => {}
+        }
+    }
 }
 
 fn apply_podman_runtime_defaults(

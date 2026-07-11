@@ -228,7 +228,8 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server. |
 | server.tls.clientCaSecretName | string | `"openshell-server-client-ca"` | K8s secret with ca.crt for client certificate verification (mTLS). Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead). |
 | server.tls.clientTlsSecretName | string | `"openshell-client-tls"` | K8s secret mounted into sandbox pods for mTLS to the server. |
-| server.workspaceDefaultStorageSize | string | `""` | Default storage size for the workspace PVC in sandbox pods. Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi"). Empty = built-in default (2Gi). |
+| server.workspaceDefaultStorageSize | string | `""` | Default storage size for the workspace PVC in sandbox pods and VMs. Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi"). Empty = built-in default (2Gi). |
+| server.workspacePersistence | bool | `true` | When true, new sandboxes get a workspace PVC mounted at `/sandbox` (Pod and VirtualMachine). Set false to omit the claim. |
 | service.healthPort | int | `8081` | Gateway health service port. |
 | service.metricsPort | int | `9090` | Gateway metrics service port. |
 | service.port | int | `8080` | Gateway gRPC/HTTP service port. |
