@@ -126,6 +126,10 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- if not (hasKey $gatewayJwt "ttl_secs") -}}{{- $_ := set $gatewayJwt "ttl_secs" (get $legacyJwt "ttlSecs" | default 3600) -}}{{- end -}}
 {{- $_ := set $config "openshell.gateway.gateway_jwt" $gatewayJwt -}}
 {{- $kubernetesCompat := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
+{{- if .Values.server.workspacePersistence -}}{{- if not (hasKey $kubernetesCompat "workspace_persistence") -}}{{- $_ := set $kubernetesCompat "workspace_persistence" true -}}{{- end -}}{{- end -}}
+{{- if .Values.server.appArmorProfile -}}{{- if not (hasKey $kubernetesCompat "app_armor_profile") -}}{{- $_ := set $kubernetesCompat "app_armor_profile" .Values.server.appArmorProfile -}}{{- end -}}{{- end -}}
+{{- if .Values.server.runtimeBackend -}}{{- if not (hasKey $kubernetesCompat "runtime_backend") -}}{{- $_ := set $kubernetesCompat "runtime_backend" .Values.server.runtimeBackend -}}{{- end -}}{{- end -}}
+{{- if .Values.server.sandboxCommand -}}{{- if not (hasKey $kubernetesCompat "sandbox_command") -}}{{- $_ := set $kubernetesCompat "sandbox_command" .Values.server.sandboxCommand -}}{{- end -}}{{- end -}}
 {{- $_ := set $config "openshell.drivers.kubernetes" $kubernetesCompat -}}
 {{- $legacyDrivers := get $legacyServer "drivers" | default dict -}}
 {{- $legacyKubernetes := get $legacyDrivers "kubernetes" | default dict -}}
