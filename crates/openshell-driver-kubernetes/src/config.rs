@@ -668,6 +668,9 @@ mod tests {
         });
         let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
         assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
     fn default_workspace_persistence_is_enabled() {
         let cfg = KubernetesComputeConfig::default();
         assert!(cfg.workspace_persistence);
