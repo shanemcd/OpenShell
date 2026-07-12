@@ -2285,6 +2285,28 @@ fn sandbox_to_k8s_spec_vm(
         upsert_env(&mut env, "OPENSHELL_SANDBOX_COMMAND", params.sandbox_command);
     }
 
+    // Mirror the pod TLS contract: path env vars + Secret volumeMount so the
+    // agent-sandbox VM backend can attach a virtio Secret disk and the guest
+    // can copy certs into /etc/openshell-tls/client.
+    let tls_enabled = !params.client_tls_secret_name.is_empty();
+    if tls_enabled {
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::TLS_CA,
+            "/etc/openshell-tls/client/ca.crt",
+        );
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::TLS_CERT,
+            "/etc/openshell-tls/client/tls.crt",
+        );
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::TLS_KEY,
+            "/etc/openshell-tls/client/tls.key",
+        );
+    }
+
     // Forward user-specified environment variables from the spec.
     if let Some(spec) = spec {
         for (key, value) in &spec.environment {
@@ -2292,15 +2314,41 @@ fn sandbox_to_k8s_spec_vm(
         }
     }
 
+    let mut volume_mounts: Vec<serde_json::Value> = Vec::new();
+    if tls_enabled {
+        volume_mounts.push(serde_json::json!({
+            "name": CLIENT_TLS_VOLUME_NAME,
+            "mountPath": "/etc/openshell-tls/client",
+            "readOnly": true
+        }));
+    }
+    if params.workspace_persistence {
+        volume_mounts.push(serde_json::json!({
+            "name": WORKSPACE_VOLUME_NAME,
+            "mountPath": WORKSPACE_MOUNT_PATH
+        }));
+    }
+
     let mut container = serde_json::json!({
         "name": "sandbox",
         "image": image,
         "env": env
     });
-    if params.workspace_persistence {
-        container["volumeMounts"] = serde_json::json!([{
-            "name": WORKSPACE_VOLUME_NAME,
-            "mountPath": WORKSPACE_MOUNT_PATH
+    if !volume_mounts.is_empty() {
+        container["volumeMounts"] = serde_json::Value::Array(volume_mounts);
+    }
+
+    let mut pod_spec = serde_json::json!({
+        "containers": [container]
+    });
+    if tls_enabled {
+        // Combined-mode supervisor starts as root; mode 0400 matches the pod path.
+        pod_spec["volumes"] = serde_json::json!([{
+            "name": CLIENT_TLS_VOLUME_NAME,
+            "secret": {
+                "secretName": params.client_tls_secret_name,
+                "defaultMode": 0o400
+            }
         }]);
     }
 
@@ -2310,9 +2358,7 @@ fn sandbox_to_k8s_spec_vm(
                 "openshell.io/sandbox-id": params.sandbox_id
             }
         },
-        "spec": {
-            "containers": [container]
-        }
+        "spec": pod_spec
     });
 
     let mut root = serde_json::Map::new();
@@ -5776,6 +5822,47 @@ mod tests {
         assert!(cr["spec"]["podTemplate"]["spec"]["containers"][0]
             .get("volumeMounts")
             .is_none());
+    }
+
+    #[test]
+    fn vm_spec_mounts_client_tls_secret_when_configured() {
+        let params = SandboxPodParams {
+            runtime_backend: "VirtualMachine",
+            client_tls_secret_name: "openshell-client-tls",
+            workspace_persistence: true,
+            ..SandboxPodParams::default()
+        };
+        let cr = sandbox_to_k8s_spec(None, &params);
+        let container = &cr["spec"]["podTemplate"]["spec"]["containers"][0];
+        let mounts = container["volumeMounts"].as_array().expect("volumeMounts");
+        assert!(mounts.iter().any(|m| {
+            m["name"] == CLIENT_TLS_VOLUME_NAME && m["mountPath"] == "/etc/openshell-tls/client"
+        }));
+        let volumes = cr["spec"]["podTemplate"]["spec"]["volumes"]
+            .as_array()
+            .expect("volumes");
+        assert!(volumes.iter().any(|v| {
+            v["name"] == CLIENT_TLS_VOLUME_NAME
+                && v["secret"]["secretName"] == "openshell-client-tls"
+        }));
+        let env = container["env"].as_array().expect("env");
+        let get = |name: &str| {
+            env.iter()
+                .find(|e| e["name"] == name)
+                .and_then(|e| e["value"].as_str())
+        };
+        assert_eq!(
+            get(openshell_core::sandbox_env::TLS_CA),
+            Some("/etc/openshell-tls/client/ca.crt")
+        );
+        assert_eq!(
+            get(openshell_core::sandbox_env::TLS_CERT),
+            Some("/etc/openshell-tls/client/tls.crt")
+        );
+        assert_eq!(
+            get(openshell_core::sandbox_env::TLS_KEY),
+            Some("/etc/openshell-tls/client/tls.key")
+        );
     }
 
     #[test]
