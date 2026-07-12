@@ -300,9 +300,9 @@ pub struct KubernetesComputeConfig {
     /// Runtime backend for sandbox workloads. When set to `"VirtualMachine"`,
     /// the driver emits `runtimeBackend: VirtualMachine` on the Sandbox CR so
     /// the agent-sandbox controller creates a KubeVirt VM instead of a Pod.
-    /// The gateway-minted sandbox token is injected directly as an env var
-    /// (VMs cannot use projected ServiceAccount token bootstrap). Empty or
-    /// `"Pod"` (default) keeps the existing Pod-based path.
+    /// Auth uses the same SA-token `IssueSandboxToken` bootstrap as Pods
+    /// (agent-sandbox mints a BoundObjectRef token into a Secret virtio disk).
+    /// Empty or `"Pod"` (default) keeps the existing Pod-based path.
     #[serde(default)]
     pub runtime_backend: String,
     /// Default command for VM sandboxes. Injected as
