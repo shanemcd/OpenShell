@@ -1023,6 +1023,518 @@ fn validated_workspace_components(root: &Path) -> Result<Vec<std::ffi::OsString>
         .collect()
 }
 
+#[cfg(unix)]
+fn identity_can_traverse(
+    metadata: &std::fs::Metadata,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    supplementary_gids: &[Gid],
+) -> bool {
+    identity_has_permissions(metadata, uid, gid, supplementary_gids, 0o1)
+}
+
+#[cfg(unix)]
+fn identity_has_permissions(
+    metadata: &std::fs::Metadata,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    supplementary_gids: &[Gid],
+    required: u32,
+) -> bool {
+    let user_id = uid.unwrap_or_else(nix::unistd::geteuid).as_raw();
+    if user_id == 0 {
+        return true;
+    }
+
+    let group_id = gid.unwrap_or_else(nix::unistd::getegid).as_raw();
+    let mode = metadata.permissions().mode();
+    if metadata.uid() == user_id {
+        mode & (required << 6) == required << 6
+    } else if metadata.gid() == group_id
+        || supplementary_gids
+            .iter()
+            .any(|supplementary_gid| supplementary_gid.as_raw() == metadata.gid())
+    {
+        mode & (required << 3) == required << 3
+    } else {
+        mode & required == required
+    }
+}
+
+#[cfg(not(any(
+    target_os = "aix",
+    target_os = "haiku",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "redox",
+    target_os = "solaris"
+)))]
+fn named_user_supplementary_groups(user_name: &str, primary_gid: Gid) -> Result<Vec<Gid>> {
+    let user_name = CString::new(user_name).map_err(|_| miette::miette!("Invalid user name"))?;
+    nix::unistd::getgrouplist(user_name.as_c_str(), primary_gid).into_diagnostic()
+}
+
+#[cfg(any(
+    target_os = "aix",
+    target_os = "haiku",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "redox",
+    target_os = "solaris"
+))]
+#[allow(clippy::unnecessary_wraps)]
+fn named_user_supplementary_groups(_user_name: &str, _primary_gid: Gid) -> Result<Vec<Gid>> {
+    // Privilege dropping does not call initgroups on these targets.
+    Ok(Vec::new())
+}
+
+#[cfg(unix)]
+fn chown_children(
+    dir: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
+) -> Result<()> {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.into_diagnostic()?;
+                chown_recursive(&entry.path(), uid, gid, do_chown)?;
+            }
+        }
+        Err(error) => {
+            debug!(
+                path = %dir.display(),
+                %error,
+                "Cannot list directory during sandbox home chown"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn chown_recursive(
+    path: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
+) -> Result<()> {
+    let meta = std::fs::symlink_metadata(path).into_diagnostic()?;
+    if meta.file_type().is_symlink() {
+        debug!(path = %path.display(), "Skipping symlink during sandbox home chown");
+        return Ok(());
+    }
+
+    if let Err(error) = do_chown(path, uid, gid) {
+        if error == nix::errno::Errno::EROFS {
+            debug!(path = %path.display(), "Skipping read-only path during sandbox home chown");
+            return Ok(());
+        }
+        return Err(error).into_diagnostic();
+    }
+
+    if meta.is_dir() {
+        chown_children(path, uid, gid, do_chown)?;
+    }
+
+    Ok(())
+}
+
+/// Prepare filesystem for the sandboxed process.
+///
+/// Creates `read_write` directories if they don't exist and sets ownership
+/// on newly-created paths to the configured sandbox user/group. This runs as
+/// the supervisor (root) before forking the child process.
+///
+/// Accepts both name-based identities (resolved via `/etc/passwd`) and numeric
+/// UIDs/GIDs (passed directly to `chown` without a passwd lookup).
+#[cfg(unix)]
+pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
+    prepare_filesystem_with_identity(policy, ResolvedProcessIdentity::default(), None, false)
+}
+
+#[cfg(unix)]
+pub fn prepare_filesystem_with_identity(
+    policy: &SandboxPolicy,
+    resolved_identity: ResolvedProcessIdentity,
+    workdir: Option<&str>,
+    prepare_workspace: bool,
+) -> Result<()> {
+    use nix::unistd::chown;
+
+    // If no user/group configured, nothing to do
+    if policy
+        .process
+        .run_as_user
+        .as_deref()
+        .is_none_or(str::is_empty)
+        && policy
+            .process
+            .run_as_group
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        return Ok(());
+    }
+
+    let (uid, gid, supplementary_gids) = resolve_filesystem_identity(policy, resolved_identity)?;
+
+    // Docker owns workspace resolution and must make the selected root usable
+    // by the final effective identity, including when both policy identity
+    // fields were explicit. Validate it before processing any user-authored
+    // read-write paths so an unsafe image path fails first. Other drivers
+    // retain their preparation.
+    if prepare_workspace {
+        let workspace = workdir.ok_or_else(|| {
+            miette::miette!("local container driver did not supply a workspace workdir")
+        })?;
+        let workspace = Path::new(workspace);
+        if workspace == Path::new(openshell_core::driver_mounts::DEFAULT_WORKSPACE_ROOT) {
+            info!(path = %workspace.display(), ?uid, ?gid, "Preparing managed workspace");
+            prepare_oci_workspace(workspace, uid, gid, &supplementary_gids)?;
+        } else {
+            info!(path = %workspace.display(), ?uid, ?gid, "Validating image workspace authority");
+            #[cfg(target_os = "linux")]
+            validate_oci_workspace_in_subprocess(policy, resolved_identity, workspace)?;
+            #[cfg(not(target_os = "linux"))]
+            validate_oci_workspace(workspace, uid, gid, &supplementary_gids)?;
+        }
+    }
+
+    // Create missing read_write paths and only chown the ones we created.
+    for path in &policy.filesystem.read_write {
+        if prepare_read_write_path(path)? {
+            debug!(
+                path = %path.display(),
+                ?uid,
+                ?gid,
+                "Setting ownership on newly created read_write path"
+            );
+            chown(path, uid, gid).into_diagnostic()?;
+        }
+    }
+
+    // Retain Kubernetes/OpenShift behavior for driver-injected numeric
+    // identities (Docker clears SANDBOX_UID). Recursively chown /sandbox
+    // unless OPENSHELL_PRESERVE_SANDBOX_OWNERSHIP=1 opts out for sealed
+    // NemoClaw/KubeVirt guest layouts with root-owned trust anchors.
+    maybe_chown_sandbox_home(Path::new("/sandbox"), uid, gid)?;
+
+    Ok(())
+}
+
+/// Whether `prepare_filesystem` should recursively chown `/sandbox`.
+///
+/// Requires [`openshell_core::sandbox_env::SANDBOX_UID`]. Skipped when
+/// [`openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP`] is `"1"`.
+#[cfg(unix)]
+fn should_recursively_chown_sandbox_home() -> bool {
+    // Docker clears SANDBOX_UID (or sets empty); only chown for driver-injected IDs.
+    if !std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok_and(|uid| !uid.is_empty()) {
+        return false;
+    }
+    match std::env::var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP) {
+        Ok(v) if v == "1" => false,
+        _ => true,
+    }
+}
+
+/// Recursively chown `sandbox_home` for driver-injected UID/GID, unless
+/// ownership preservation is requested.
+#[cfg(unix)]
+fn maybe_chown_sandbox_home(
+    sandbox_home: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+) -> Result<()> {
+    if !should_recursively_chown_sandbox_home() {
+        if std::env::var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP).as_deref()
+            == Ok("1")
+        {
+            info!(
+                path = %sandbox_home.display(),
+                "Preserving sandbox ownership (OPENSHELL_PRESERVE_SANDBOX_OWNERSHIP=1)"
+            );
+        }
+        return Ok(());
+    }
+    if !sandbox_home.exists() {
+        return Ok(());
+    }
+    info!(
+        path = %sandbox_home.display(),
+        ?uid,
+        ?gid,
+        "Chowning sandbox home for driver-injected UID/GID"
+    );
+    chown_sandbox_home(sandbox_home, uid, gid)
+}
+
+#[cfg(unix)]
+fn resolve_filesystem_identity(
+    policy: &SandboxPolicy,
+    resolved_identity: ResolvedProcessIdentity,
+) -> Result<(Option<Uid>, Option<Gid>, Vec<Gid>)> {
+    let user_name = policy
+        .process
+        .run_as_user
+        .as_deref()
+        .filter(|name| !name.is_empty());
+    let group_name = policy
+        .process
+        .run_as_group
+        .as_deref()
+        .filter(|name| !name.is_empty());
+
+    let uid = match resolved_identity.uid() {
+        Some(uid) => Some(Uid::from_raw(uid)),
+        None => match user_name {
+            Some(name) if name.parse::<u32>().is_ok() => {
+                Some(Uid::from_raw(name.parse().into_diagnostic()?))
+            }
+            Some(name) => User::from_name(name).into_diagnostic()?.map(|u| u.uid),
+            _ => None,
+        },
+    };
+
+    // Resolve GID: numeric values are passed directly; names resolve via group.
+    let gid = match resolved_identity.gid() {
+        Some(gid) => Some(Gid::from_raw(gid)),
+        None => match group_name {
+            Some(name) if name.parse::<u32>().is_ok() => {
+                Some(Gid::from_raw(name.parse().into_diagnostic()?))
+            }
+            Some(name) => Group::from_name(name).into_diagnostic()?.map(|g| g.gid),
+            _ => None,
+        },
+    };
+
+    let supplementary_gids = match user_name {
+        Some(name) if name.parse::<u32>().is_err() => {
+            let primary_gid = if let Some(gid) = gid {
+                gid
+            } else {
+                let uid =
+                    uid.ok_or_else(|| miette::miette!("Failed to resolve sandbox user '{name}'"))?;
+                User::from_uid(uid)
+                    .into_diagnostic()?
+                    .ok_or_else(|| miette::miette!("Failed to resolve user from UID {uid}"))?
+                    .gid
+            };
+            if resolved_identity.uid().is_some() {
+                crate::identity::resolve_oci_supplementary_gids(name, primary_gid.as_raw())?
+                    .into_iter()
+                    .map(Gid::from_raw)
+                    .collect()
+            } else {
+                named_user_supplementary_groups(name, primary_gid)?
+            }
+        }
+        _ => Vec::new(),
+    };
+
+    Ok((uid, gid, supplementary_gids))
+}
+
+#[cfg(not(unix))]
+pub fn prepare_filesystem(_policy: &SandboxPolicy) -> Result<()> {
+    Ok(())
+}
+
+// `effective_gid`/`effective_uid` are intentionally parallel names (same role
+// for different identifiers) and the noise from renaming would obscure intent.
+#[cfg(unix)]
+#[allow(clippy::similar_names)]
+pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
+    drop_privileges_with_identity(policy, ResolvedProcessIdentity::default())
+}
+
+#[cfg(unix)]
+#[allow(clippy::similar_names)]
+pub fn drop_privileges_with_identity(
+    policy: &SandboxPolicy,
+    resolved_identity: ResolvedProcessIdentity,
+) -> Result<()> {
+    let user_name = match policy.process.run_as_user.as_deref() {
+        Some(name) if !name.is_empty() => Some(name),
+        _ => None,
+    };
+    let group_name = match policy.process.run_as_group.as_deref() {
+        Some(name) if !name.is_empty() => Some(name),
+        _ => None,
+    };
+
+    // If no user/group is configured and we are running as root, fall back to
+    // "sandbox:sandbox" instead of silently keeping root.  This covers the
+    // local/dev-mode path for drivers that provide no identity metadata.
+    // For non-root runtimes, the no-op is safe -- we are already unprivileged.
+    if user_name.is_none() && group_name.is_none() {
+        if nix::unistd::geteuid().is_root() {
+            let mut fallback = policy.clone();
+            fallback.process.run_as_user = Some("sandbox".into());
+            fallback.process.run_as_group = Some("sandbox".into());
+            return drop_privileges_with_identity(&fallback, resolved_identity);
+        }
+        return Ok(());
+    }
+
+    // Resolve UID: numeric values are used directly; names resolve via passwd.
+    let target_uid = match resolved_identity.uid() {
+        Some(uid) => Uid::from_raw(uid),
+        None => match user_name {
+            Some(name) if name.parse::<u32>().is_ok() => {
+                Uid::from_raw(name.parse().into_diagnostic()?)
+            }
+            Some(name) => {
+                User::from_name(name)
+                    .into_diagnostic()?
+                    .ok_or_else(|| miette::miette!("Sandbox user not found: {name}"))?
+                    .uid
+            }
+            None => nix::unistd::geteuid(),
+        },
+    };
+
+    // Resolve group: if a numeric GID is configured use it directly.
+    // Otherwise try name resolution, then fall back to current user's primary group.
+    let target_gid = match resolved_identity.gid() {
+        Some(gid) => Gid::from_raw(gid),
+        None => match group_name {
+            Some(name) if name.parse::<u32>().is_ok() => {
+                Gid::from_raw(name.parse().into_diagnostic()?)
+            }
+            Some(name) => {
+                Group::from_name(name)
+                    .into_diagnostic()?
+                    .ok_or_else(|| miette::miette!("Sandbox group not found: {name}"))?
+                    .gid
+            }
+            None => match target_uid.as_raw() {
+                0 => nix::unistd::getegid(),
+                _ => Group::from_gid(
+                    User::from_uid(target_uid)
+                        .into_diagnostic()?
+                        .ok_or_else(|| {
+                            miette::miette!("Failed to resolve user from UID {target_uid}")
+                        })?
+                        .gid,
+                )
+                .into_diagnostic()?
+                .map_or_else(nix::unistd::getegid, |g| g.gid),
+            },
+        },
+    };
+
+    // Resolve the name for initgroups only for the existing explicit-policy
+    // path. OCI-derived users carry a numeric UID from the bounded parser and
+    // must not be looked up again through NSS.
+    let user_name_is_numeric = user_name.is_some_and(|n| n.parse::<u32>().is_ok());
+    let initgroups_name =
+        if user_name.is_some() && !user_name_is_numeric && resolved_identity.uid().is_none() {
+            Some(
+                User::from_uid(target_uid)
+                    .into_diagnostic()?
+                    .ok_or_else(|| {
+                        miette::miette!("Failed to resolve user record for UID {target_uid}")
+                    })?
+                    .name,
+            )
+        } else {
+            None
+        };
+
+    if target_uid != nix::unistd::geteuid() {
+        if resolved_identity.uses_oci_user_fallback() {
+            // OCI named users use the bounded /etc/group parser shared with
+            // workspace validation. Numeric OCI users resolve to an empty
+            // list. Never retain the root supervisor's inherited groups.
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "haiku",
+                target_os = "redox"
+            )))]
+            {
+                let (_, _, supplementary_gids) =
+                    resolve_filesystem_identity(policy, resolved_identity)?;
+                nix::unistd::setgroups(&supplementary_gids).into_diagnostic()?;
+            }
+        } else if let Some(ref user_name) = initgroups_name {
+            let user_cstr = CString::new(user_name.as_str())
+                .map_err(|_| miette::miette!("Invalid user name"))?;
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "haiku",
+                target_os = "redox"
+            ))]
+            {
+                let _ = user_cstr;
+            }
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "haiku",
+                target_os = "redox"
+            )))]
+            {
+                nix::unistd::initgroups(user_cstr.as_c_str(), target_gid).into_diagnostic()?;
+            }
+        }
+    }
+
+    if target_gid != nix::unistd::getegid() {
+        nix::unistd::setgid(target_gid).into_diagnostic()?;
+    }
+
+    // Verify effective GID actually changed (defense-in-depth, CWE-250 / CERT POS37-C)
+    let effective_gid = nix::unistd::getegid();
+    if effective_gid != target_gid {
+        return Err(miette::miette!(
+            "Privilege drop verification failed: expected effective GID {}, got {}",
+            target_gid,
+            effective_gid
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    if nix::unistd::geteuid().is_root() {
+        drop_capability_bounding_set()?;
+    }
+
+    if user_name.is_some() {
+        if target_uid != nix::unistd::geteuid() {
+            nix::unistd::setuid(target_uid).into_diagnostic()?;
+        }
+
+        // Verify effective UID actually changed (defense-in-depth, CWE-250 / CERT POS37-C)
+        let effective_uid = nix::unistd::geteuid();
+        if effective_uid != target_uid {
+            return Err(miette::miette!(
+                "Privilege drop verification failed: expected effective UID {}, got {}",
+                target_uid,
+                effective_uid
+            ));
+        }
+
+        // Verify root cannot be re-acquired (CERT POS37-C hardening).
+        // If we dropped from root, setuid(0) must fail; success means privileges
+        // were not fully relinquished.
+        if nix::unistd::setuid(Uid::from_raw(0)).is_ok() && target_uid.as_raw() != 0 {
+            return Err(miette::miette!(
+                "Privilege drop verification failed: process can still re-acquire root (UID 0) \
+                 after switching to UID {}",
+                target_uid
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Process exit status.
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessStatus {
@@ -1684,5 +2196,172 @@ mod tests {
             );
         }
         assert!(stdout.contains("PATH=/usr/bin:/bin"));
+    }
+
+    // ---- Numeric UID tests (Phase 2) ----
+
+    // Even a failing setuid(0) probe synchronizes libc credentials across all
+    // threads. Other tests own seccomp-notified launcher threads in this same
+    // process; signaling those while they await their broker can deadlock the
+    // parallel harness. Re-exec just the credential probe, without those threads.
+    fn numeric_uid_probe_runs_in_child(test_name: &str) -> bool {
+        const MARKER: &str = "OPENSHELL_TEST_ISOLATED_NUMERIC_UID_PROBE";
+        if std::env::var(MARKER).as_deref() == Ok(test_name) {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", test_name, "--test-threads=1", "--nocapture"])
+            .env(MARKER, test_name)
+            .output()
+            .expect("run isolated credential probe");
+        assert!(
+            output.status.success(),
+            "isolated credential probe failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    #[test]
+    fn drop_privileges_accepts_numeric_uid() {
+        if !numeric_uid_probe_runs_in_child("process::tests::drop_privileges_accepts_numeric_uid") {
+            return;
+        }
+        // When running as non-root, a numeric UID/GID that matches the
+        // current process should succeed without any passwd lookup.
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+
+        let uid_raw = nix::unistd::geteuid().as_raw();
+        let gid_raw = nix::unistd::getegid().as_raw();
+
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(uid_raw.to_string()),
+            run_as_group: Some(gid_raw.to_string()),
+        });
+
+        assert!(
+            drop_privileges(&policy).is_ok(),
+            "should accept current process UID/GID as numeric strings"
+        );
+    }
+
+    #[test]
+    fn drop_privileges_numeric_uid_skips_initgroups() {
+        if !numeric_uid_probe_runs_in_child(
+            "process::tests::drop_privileges_numeric_uid_skips_initgroups",
+        ) {
+            return;
+        }
+        // When running as non-root with a numeric user but group matches,
+        // initgroups should not be called (guard: target_uid != geteuid()).
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+
+        let current_uid = nix::unistd::geteuid().as_raw();
+
+        // Use a different group name that exists (the current one).
+        let current_group = Group::from_gid(nix::unistd::getegid())
+            .expect("should resolve current group")
+            .expect("current group should exist");
+
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(current_uid.to_string()), // numeric UID, no passwd entry needed
+            run_as_group: Some(current_group.name),     // name-based group
+        });
+
+        assert!(
+            drop_privileges(&policy).is_ok(),
+            "should accept numeric UID with name-based group (initgroups guarded)"
+        );
+    }
+
+    #[test]
+    fn numeric_uid_privilege_drop_child() {
+        if std::env::var_os("OPENSHELL_TEST_NUMERIC_UID_CHILD").is_none() {
+            return;
+        }
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("999999".into()),
+            run_as_group: Some("999999".into()),
+        });
+        match drop_privileges(&policy) {
+            Ok(()) => {}
+            Err(e) => {
+                assert!(
+                    !e.to_string().contains("Failed to resolve user record"),
+                    "unexpected error for numeric UID without passwd entry: {e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn drop_privileges_numeric_uid_without_passwd_entry_skips_lookup() {
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current exe"));
+        cmd.arg("numeric_uid_privilege_drop_child")
+            .arg("--nocapture")
+            .env("OPENSHELL_TEST_NUMERIC_UID_CHILD", "1")
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::piped());
+        let output = cmd.output().expect("spawn child");
+        assert!(
+            output.status.success(),
+            "numeric UID privilege drop child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Serialize env mutations across preserve-ownership tests.
+    #[cfg(unix)]
+    static PRESERVE_OWNERSHIP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    fn with_sandbox_uid_env<F: FnOnce()>(preserve: Option<&str>, f: F) {
+        let _guard = PRESERVE_OWNERSHIP_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialized by PRESERVE_OWNERSHIP_ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var(openshell_core::sandbox_env::SANDBOX_UID, "10001");
+            match preserve {
+                Some(v) => std::env::set_var(
+                    openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP,
+                    v,
+                ),
+                None => std::env::remove_var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP),
+            }
+        }
+        f();
+        unsafe {
+            std::env::remove_var(openshell_core::sandbox_env::SANDBOX_UID);
+            std::env::remove_var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_recursively_chown_sandbox_home_respects_preserve_flag() {
+        with_sandbox_uid_env(None, || {
+            assert!(should_recursively_chown_sandbox_home());
+        });
+        with_sandbox_uid_env(Some("1"), || {
+            assert!(!should_recursively_chown_sandbox_home());
+        });
+        with_sandbox_uid_env(Some("0"), || {
+            assert!(should_recursively_chown_sandbox_home());
+        });
+        let _guard = PRESERVE_OWNERSHIP_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var(openshell_core::sandbox_env::SANDBOX_UID);
+            std::env::remove_var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP);
+        }
+        assert!(!should_recursively_chown_sandbox_home());
     }
 }
