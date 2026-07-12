@@ -2191,7 +2191,7 @@ fn sandbox_to_k8s_spec(
     }
 
     let driver_config =
-        validated_driver_config_for_spec(spec, provider_spiffe_socket_path(params))?;
+        kubernetes_driver_config_for_spec(spec, provider_spiffe_socket_path(params))?;
     let mut root = serde_json::Map::new();
 
     // Determine early whether OpenShell should inject its default workspace
