@@ -61,15 +61,26 @@ pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
 /// Default storage size for the workspace PVC.
 pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 
-/// Driver-owned requirements for the Kubernetes sandbox runtime.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct KubernetesSandboxRuntimeConfig {
-    /// Explicit operator assertion that the cluster CNI enforces
-    /// `networking.k8s.io/v1` `NetworkPolicy` for the sandbox namespaces.
-    pub network_policy_enforced: bool,
-    /// TCP port exposed by the workload boundary to its paired control pod.
-    pub boundary_port: u16,
+/// Default non-root UID for relaxed Kubernetes network supervisor sidecars.
+pub const DEFAULT_PROXY_UID: u32 = 1337;
+
+fn default_true() -> bool {
+    true
+}
+
+/// How the supervisor binary is delivered into sandbox pods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SupervisorSideloadMethod {
+    /// Mount the supervisor OCI image directly as a read-only volume
+    /// (requires Kubernetes >= v1.33 with the `ImageVolume` feature gate,
+    /// or >= v1.36 where it is GA).
+    #[default]
+    ImageVolume,
+    /// Copy the binary via an init container and emptyDir volume.
+    /// Works on all Kubernetes versions.
+    InitContainer,
+ 50fb5e25 (Add thin VirtualMachine runtime backend for Kubernetes sandboxes.)
 }
 
 impl Default for KubernetesSandboxRuntimeConfig {
@@ -229,6 +240,11 @@ pub struct KubernetesComputeConfig {
     /// `StorageClass`, otherwise the workspace PVC stays `Pending` and the
     /// sandbox never starts.
     pub workspace_storage_class: String,
+    /// When true (default), new sandboxes get a `workspace` PVC mounted at
+    /// `/sandbox` for both Pod and VirtualMachine backends. Set false to
+    /// omit `volumeClaimTemplates` and the workspace mount.
+    #[serde(default = "default_true")]
+    pub workspace_persistence: bool,
     /// Default Kubernetes `runtimeClassName` for sandbox pods.
     /// Applied when a `CreateSandbox` request does not specify one.
     /// Empty string (default) = omit the field, using the cluster default.
@@ -250,8 +266,25 @@ pub struct KubernetesComputeConfig {
         deserialize_with = "deserialize_provider_spiffe_workload_api_socket_path"
     )]
     pub provider_spiffe_workload_api_socket_path: String,
-    /// Exact UID shared by `openshell-sandbox`, its agent children, the trusted
-    /// workspace/bootstrap init containers, and `openshell-supervisor`.
+/// Runtime backend for sandbox workloads. When set to `"VirtualMachine"`,
+    /// the driver emits `runtimeBackend: VirtualMachine` on the Sandbox CR so
+    /// the agent-sandbox controller creates a KubeVirt VM instead of a Pod.
+    /// Auth uses the same SA-token `IssueSandboxToken` bootstrap as Pods
+    /// (agent-sandbox mints a BoundObjectRef token into a Secret virtio disk).
+    /// Empty or `"Pod"` (default) keeps the existing Pod-based path.
+    #[serde(default)]
+    pub runtime_backend: String,
+    /// Default command for VM sandboxes. Injected as
+    /// `OPENSHELL_SANDBOX_COMMAND` so the supervisor runs this instead of
+    /// `/bin/bash`. Only used when `runtime_backend` is `VirtualMachine`.
+    #[serde(default)]
+    pub sandbox_command: String,
+    /// UID used for privilege-drop operations and workspace init container
+    /// ownership. The supervisor container always runs as UID 0 (root) to
+    /// create network namespaces and configure Landlock/seccomp; the
+    /// `sandbox_uid` is injected as the `SANDBOX_UID` environment variable so
+    /// the supervisor knows which UID to drop to for child processes.
+ 50fb5e25 (Add thin VirtualMachine runtime backend for Kubernetes sandboxes.)
     /// When empty, the driver auto-detects from `OpenShift` SCC annotations on
     /// the target namespace; if those are also absent, falls back to `10001`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -325,9 +358,12 @@ impl Default for KubernetesComputeConfig {
             enable_user_namespaces: false,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
             workspace_storage_class: String::new(),
+            workspace_persistence: true,
             default_runtime_class_name: String::new(),
             sa_token_ttl_secs: 3600,
             provider_spiffe_workload_api_socket_path: String::new(),
+            runtime_backend: String::new(),
+            sandbox_command: String::new(),
             sandbox_uid: None,
             sandbox_gid: None,
         }
@@ -355,6 +391,11 @@ impl KubernetesComputeConfig {
             self.sa_token_ttl_secs
                 .clamp(MIN_SA_TOKEN_TTL_SECS, MAX_SA_TOKEN_TTL_SECS)
         }
+    }
+
+    #[must_use]
+    pub fn is_vm_backend(&self) -> bool {
+        self.runtime_backend.eq_ignore_ascii_case("VirtualMachine")
     }
 
     #[must_use]
@@ -886,6 +927,21 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.workspace_storage_class, "fast-ssd");
+    }
+
+    #[test]
+    fn default_workspace_persistence_is_enabled() {
+        let cfg = KubernetesComputeConfig::default();
+        assert!(cfg.workspace_persistence);
+        let cfg: KubernetesComputeConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.workspace_persistence);
+    }
+
+    #[test]
+    fn serde_override_workspace_persistence_false() {
+        let cfg: KubernetesComputeConfig =
+            serde_json::from_str(r#"{"workspace_persistence": false}"#).unwrap();
+        assert!(!cfg.workspace_persistence);
     }
 
     #[test]

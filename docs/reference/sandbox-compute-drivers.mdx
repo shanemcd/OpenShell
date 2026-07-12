@@ -443,6 +443,9 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `proxy_connect_by_hostname` | `upstreamProxy.connectByHostname` | Send hostnames rather than validated IPs in CONNECT requests. Use only when proxy ACLs require hostname targets. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `workspace_storage_class` | `server.workspaceStorageClass` | Set the `StorageClass` for the workspace PVC. Empty (default) omits `storageClassName` and uses the cluster's default `StorageClass`. Set this on clusters with no default `StorageClass`, otherwise the workspace PVC stays `Pending` and the sandbox never starts. |
+| `workspace_persistence` | `server.workspacePersistence` | When true (default), inject a workspace PVC mounted at `/sandbox` for Pod and VirtualMachine backends. |
+| `runtime_backend` | `server.runtimeBackend` | Set to `VirtualMachine` so agent-sandbox creates a KubeVirt VM instead of a Pod. Empty or `Pod` keeps the Pod path. |
+| `sandbox_command` | `server.sandboxCommand` | Default `OPENSHELL_SANDBOX_COMMAND` for VirtualMachine sandboxes (for example `/usr/local/bin/nemoclaw-start-vm`). |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
 
 Managed-mode Secret copying requires the gateway ServiceAccount to create
