@@ -1548,6 +1548,7 @@ impl KubernetesComputeDriver {
             app_armor_profile: self.config.app_armor_profile.as_ref(),
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
             workspace_storage_class: &self.config.workspace_storage_class,
+            workspace_persistence: self.config.workspace_persistence,
             default_runtime_class_name: &self.config.default_runtime_class_name,
             sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
             provider_spiffe_enabled: self.config.provider_spiffe_enabled(),
@@ -1556,6 +1557,8 @@ impl KubernetesComputeDriver {
                 .provider_spiffe_workload_api_socket_path,
             sandbox_uid: resolved_user_id,
             sandbox_gid: resolved_group_id,
+            runtime_backend: &self.config.runtime_backend,
+            sandbox_command: &self.config.sandbox_command,
         };
         validate_sidecar_proxy_identity(&params)?;
 
@@ -3560,6 +3563,8 @@ struct SandboxPodParams<'a> {
     app_armor_profile: Option<&'a AppArmorProfile>,
     workspace_default_storage_size: &'a str,
     workspace_storage_class: &'a str,
+    /// When true, emit a workspace PVC + `/sandbox` mount (Pod and VM).
+    workspace_persistence: bool,
     default_runtime_class_name: &'a str,
     /// Lifetime (seconds) of the projected `ServiceAccount` token used
     /// for the bootstrap `IssueSandboxToken` exchange.
@@ -3570,6 +3575,10 @@ struct SandboxPodParams<'a> {
     sandbox_uid: u32,
     /// Resolved sandbox GID for PVC init container operations.
     sandbox_gid: u32,
+    /// Runtime backend: empty or "Pod" for pods, "VirtualMachine" for KubeVirt VMs.
+    runtime_backend: &'a str,
+    /// Default command for VM sandboxes.
+    sandbox_command: &'a str,
 }
 
 impl Default for SandboxPodParams<'_> {
@@ -3601,12 +3610,15 @@ impl Default for SandboxPodParams<'_> {
             app_armor_profile: None,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
             workspace_storage_class: "",
+            workspace_persistence: true,
             default_runtime_class_name: "",
             sa_token_ttl_secs: 3600,
             provider_spiffe_enabled: false,
             provider_spiffe_workload_api_socket_path: "",
             sandbox_uid: DEFAULT_SANDBOX_UID,
             sandbox_gid: DEFAULT_SANDBOX_UID,
+            runtime_backend: "",
+            sandbox_command: "",
         }
     }
 }
@@ -3660,17 +3672,22 @@ fn sandbox_to_k8s_spec(
     spec: Option<&SandboxSpec>,
     params: &SandboxPodParams<'_>,
 ) -> Result<serde_json::Value, String> {
+    if params.runtime_backend.eq_ignore_ascii_case("VirtualMachine") {
+        return Ok(sandbox_to_k8s_spec_vm(spec, params));
+    }
+
     let driver_config =
         kubernetes_driver_config_for_spec(spec, provider_spiffe_socket_path(params))?;
     let mut root = serde_json::Map::new();
 
     // Determine early whether OpenShell should inject its default workspace
     // PVC. Explicit Kubernetes driver-config mounts under /sandbox/ take
-    // ownership of workspace persistence.
+    // ownership of workspace persistence. The config flag can disable injection.
     // We need this flag before building the podTemplate because the workspace
     // persistence transforms are applied inside sandbox_template_to_k8s.
     let user_has_explicit_workspace_mount = driver_config.has_explicit_sandbox_data_mount();
-    let inject_workspace = !user_has_explicit_workspace_mount;
+    let inject_workspace =
+        params.workspace_persistence && !user_has_explicit_workspace_mount;
 
     if let Some(spec) = spec {
         let pod_env = spec_pod_env(Some(spec));
@@ -3726,6 +3743,158 @@ fn sandbox_to_k8s_spec(
     Ok(serde_json::Value::Object(
         std::iter::once(("spec".to_string(), serde_json::Value::Object(root))).collect(),
     ))
+}
+
+/// Build a Sandbox CR spec for the VirtualMachine runtime backend.
+///
+/// The agent-sandbox controller uses `containers[0].image` as the containerDisk
+/// and passes all container env vars into the VM via a Secret virtio disk.
+/// The VM image has the supervisor baked in; guest prepare scripts mount disks
+/// and bootstrap the supervisor. Auth uses the same `IssueSandboxToken` path
+/// as Pods: a Secret volume (`{sandbox}-openshell-sa-token`) holds a rotating
+/// BoundObjectRef SA JWT minted by agent-sandbox against a companion bootstrap
+/// Pod. When `workspace_persistence` is enabled, a workspace PVC is attached
+/// the same way as for Pods.
+fn sandbox_to_k8s_spec_vm(
+    spec: Option<&SandboxSpec>,
+    params: &SandboxPodParams<'_>,
+) -> serde_json::Value {
+    let image = spec
+        .and_then(|s| s.template.as_ref())
+        .map(|t| t.image.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(params.default_image);
+
+    let mut env = Vec::new();
+    upsert_env(&mut env, openshell_core::sandbox_env::SANDBOX_ID, params.sandbox_id);
+    upsert_env(&mut env, openshell_core::sandbox_env::SANDBOX, params.sandbox_name);
+    upsert_env(&mut env, openshell_core::sandbox_env::ENDPOINT, params.grpc_endpoint);
+
+    // Same bootstrap contract as Pods: exchange a BoundObjectRef SA JWT for a
+    // gateway-minted sandbox token (supports rebootstrap after VM reboot).
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::K8S_SA_TOKEN_FILE,
+        "/var/run/secrets/openshell/token",
+    );
+
+    if !params.sandbox_command.is_empty() {
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::SANDBOX_COMMAND,
+            params.sandbox_command,
+        );
+    }
+
+    // Mirror the pod TLS contract: path env vars + Secret volumeMount so the
+    // agent-sandbox VM backend can attach a virtio Secret disk and the guest
+    // can copy certs into /etc/openshell-tls/client.
+    let tls_enabled = !params.client_tls_secret_name.is_empty();
+    if tls_enabled {
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::TLS_CA,
+            "/etc/openshell-tls/client/ca.crt",
+        );
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::TLS_CERT,
+            "/etc/openshell-tls/client/tls.crt",
+        );
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::TLS_KEY,
+            "/etc/openshell-tls/client/tls.key",
+        );
+    }
+
+    // Forward user-specified environment variables from the spec.
+    if let Some(spec) = spec {
+        for (key, value) in &spec.environment {
+            upsert_env(&mut env, key, value);
+        }
+    }
+
+    let mut volume_mounts: Vec<serde_json::Value> = Vec::new();
+    volume_mounts.push(serde_json::json!({
+        "name": SERVICE_ACCOUNT_TOKEN_VOLUME_NAME,
+        "mountPath": SERVICE_ACCOUNT_TOKEN_MOUNT_PATH,
+        "readOnly": true
+    }));
+    if tls_enabled {
+        volume_mounts.push(serde_json::json!({
+            "name": CLIENT_TLS_VOLUME_NAME,
+            "mountPath": "/etc/openshell-tls/client",
+            "readOnly": true
+        }));
+    }
+    if params.workspace_persistence {
+        volume_mounts.push(serde_json::json!({
+            "name": WORKSPACE_VOLUME_NAME,
+            "mountPath": WORKSPACE_MOUNT_PATH
+        }));
+    }
+
+    let container = serde_json::json!({
+        "name": "sandbox",
+        "image": image,
+        "env": env,
+        "volumeMounts": volume_mounts
+    });
+
+    let sa_secret_name = format!("{}-openshell-sa-token", params.sandbox_name);
+    let mut volumes = vec![serde_json::json!({
+        "name": SERVICE_ACCOUNT_TOKEN_VOLUME_NAME,
+        "secret": {
+            "secretName": sa_secret_name,
+            "defaultMode": 0o400
+        }
+    })];
+    if tls_enabled {
+        // Combined-mode supervisor starts as root; mode 0400 matches the pod path.
+        volumes.push(serde_json::json!({
+            "name": CLIENT_TLS_VOLUME_NAME,
+            "secret": {
+                "secretName": params.client_tls_secret_name,
+                "defaultMode": 0o400
+            }
+        }));
+    }
+
+    let mut pod_spec = serde_json::json!({
+        "containers": [container],
+        "volumes": volumes,
+        "automountServiceAccountToken": false
+    });
+    if !params.service_account_name.is_empty() {
+        pod_spec["serviceAccountName"] = serde_json::json!(params.service_account_name);
+    }
+
+    let pod_template = serde_json::json!({
+        "metadata": {
+            "annotations": {
+                "openshell.io/sandbox-id": params.sandbox_id
+            }
+        },
+        "spec": pod_spec
+    });
+
+    let mut root = serde_json::Map::new();
+    root.insert("runtimeBackend".to_string(), serde_json::json!("VirtualMachine"));
+    root.insert("podTemplate".to_string(), pod_template);
+    if params.workspace_persistence {
+        root.insert(
+            "volumeClaimTemplates".to_string(),
+            default_workspace_volume_claim_templates(
+                params.workspace_default_storage_size,
+                params.workspace_storage_class,
+            ),
+        );
+    }
+
+    serde_json::Value::Object(
+        std::iter::once(("spec".to_string(), serde_json::Value::Object(root))).collect(),
+    )
 }
 
 #[cfg(test)]
@@ -8443,6 +8612,106 @@ mod tests {
     }
 
     #[test]
+    fn vm_spec_includes_workspace_pvc_when_persistence_enabled() {
+        let params = SandboxPodParams {
+            runtime_backend: "VirtualMachine",
+            default_image: "registry.example/hermes:latest",
+            workspace_persistence: true,
+            workspace_default_storage_size: "10Gi",
+            sandbox_command: "/usr/local/bin/nemoclaw-start-vm",
+            sandbox_name: "hermes",
+            ..SandboxPodParams::default()
+        };
+        let cr = sandbox_to_k8s_spec(None, &params).expect("vm spec");
+        assert_eq!(cr["spec"]["runtimeBackend"], "VirtualMachine");
+        assert_eq!(
+            cr["spec"]["volumeClaimTemplates"][0]["metadata"]["name"],
+            WORKSPACE_VOLUME_NAME
+        );
+        assert_eq!(
+            cr["spec"]["volumeClaimTemplates"][0]["spec"]["resources"]["requests"]["storage"],
+            "10Gi"
+        );
+        let mounts = cr["spec"]["podTemplate"]["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts");
+        assert!(mounts.iter().any(|m| {
+            m["name"] == WORKSPACE_VOLUME_NAME && m["mountPath"] == WORKSPACE_MOUNT_PATH
+        }));
+        // VMs must not get the Pod workspace-init container.
+        assert!(cr["spec"]["podTemplate"]["spec"]
+            .get("initContainers")
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true));
+    }
+
+    #[test]
+    fn vm_spec_omits_workspace_pvc_when_persistence_disabled() {
+        let params = SandboxPodParams {
+            runtime_backend: "VirtualMachine",
+            workspace_persistence: false,
+            sandbox_name: "hermes",
+            ..SandboxPodParams::default()
+        };
+        let cr = sandbox_to_k8s_spec(None, &params).expect("vm spec");
+        assert!(cr["spec"].get("volumeClaimTemplates").is_none());
+        let mounts = cr["spec"]["podTemplate"]["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts");
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| m["name"] == WORKSPACE_VOLUME_NAME),
+            "workspace mount must be absent when persistence is disabled"
+        );
+        assert!(mounts.iter().any(|m| {
+            m["name"] == SERVICE_ACCOUNT_TOKEN_VOLUME_NAME
+                && m["mountPath"] == SERVICE_ACCOUNT_TOKEN_MOUNT_PATH
+        }));
+    }
+
+    #[test]
+    fn vm_spec_uses_sa_token_bootstrap_not_static_jwt() {
+        let params = SandboxPodParams {
+            runtime_backend: "VirtualMachine",
+            sandbox_name: "hermes",
+            sandbox_id: "sb-id-1",
+            service_account_name: "openshell-sandbox",
+            workspace_persistence: false,
+            ..SandboxPodParams::default()
+        };
+        let cr = sandbox_to_k8s_spec(None, &params).expect("vm spec");
+        let container = &cr["spec"]["podTemplate"]["spec"]["containers"][0];
+        let env = container["env"].as_array().expect("env");
+        let get = |name: &str| {
+            env.iter()
+                .find(|e| e["name"] == name)
+                .and_then(|e| e["value"].as_str())
+        };
+        assert_eq!(
+            get(openshell_core::sandbox_env::K8S_SA_TOKEN_FILE),
+            Some("/var/run/secrets/openshell/token")
+        );
+        assert!(get(openshell_core::sandbox_env::SANDBOX_TOKEN).is_none());
+        assert_eq!(
+            cr["spec"]["podTemplate"]["spec"]["serviceAccountName"],
+            "openshell-sandbox"
+        );
+        let volumes = cr["spec"]["podTemplate"]["spec"]["volumes"]
+            .as_array()
+            .expect("volumes");
+        assert!(volumes.iter().any(|v| {
+            v["name"] == SERVICE_ACCOUNT_TOKEN_VOLUME_NAME
+                && v["secret"]["secretName"] == "hermes-openshell-sa-token"
+        }));
+        assert_eq!(
+            cr["spec"]["podTemplate"]["metadata"]["annotations"]["openshell.io/sandbox-id"],
+            "sb-id-1"
+        );
+    }
+
+    #[test]
     fn workspace_storage_class_omitted_from_cr_spec_when_empty() {
         let cr = sandbox_to_k8s_spec_for_test(
             Some(&SandboxSpec::default()),
@@ -8456,7 +8725,7 @@ mod tests {
     }
 
     #[test]
-    fn upstream_proxy_is_injected_only_into_network_supervisors() {
+fn upstream_proxy_is_injected_only_into_network_supervisors() {
         let params = SandboxPodParams {
             topology: SupervisorTopology::Sidecar,
             supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
@@ -8649,11 +8918,50 @@ mod tests {
                 .get("app.kubernetes.io/name")
                 .map(String::as_str),
             Some("openshell")
+
+fn vm_spec_mounts_client_tls_secret_when_configured() {
+        let params = SandboxPodParams {
+            runtime_backend: "VirtualMachine",
+            client_tls_secret_name: "openshell-client-tls",
+            workspace_persistence: true,
+            sandbox_name: "hermes",
+            ..SandboxPodParams::default()
+        };
+        let cr = sandbox_to_k8s_spec(None, &params).expect("vm spec");
+        let container = &cr["spec"]["podTemplate"]["spec"]["containers"][0];
+        let mounts = container["volumeMounts"].as_array().expect("volumeMounts");
+        assert!(mounts.iter().any(|m| {
+            m["name"] == CLIENT_TLS_VOLUME_NAME && m["mountPath"] == "/etc/openshell-tls/client"
+        }));
+        let volumes = cr["spec"]["podTemplate"]["spec"]["volumes"]
+            .as_array()
+            .expect("volumes");
+        assert!(volumes.iter().any(|v| {
+            v["name"] == CLIENT_TLS_VOLUME_NAME
+                && v["secret"]["secretName"] == "openshell-client-tls"
+        }));
+        let env = container["env"].as_array().expect("env");
+        let get = |name: &str| {
+            env.iter()
+                .find(|e| e["name"] == name)
+                .and_then(|e| e["value"].as_str())
+        };
+        assert_eq!(
+            get(openshell_core::sandbox_env::TLS_CA),
+            Some("/etc/openshell-tls/client/ca.crt")
+        );
+        assert_eq!(
+            get(openshell_core::sandbox_env::TLS_CERT),
+            Some("/etc/openshell-tls/client/tls.crt")
+        );
+        assert_eq!(
+            get(openshell_core::sandbox_env::TLS_KEY),
+            Some("/etc/openshell-tls/client/tls.key")
         );
     }
 
     #[test]
-    fn image_pull_secret_copy_keeps_only_portable_secret_fields() {
+fn image_pull_secret_copy_keeps_only_portable_secret_fields() {
         let source: Secret = serde_json::from_value(serde_json::json!({
             "apiVersion": "v1",
             "kind": "Secret",
@@ -8765,6 +9073,35 @@ mod tests {
         assert_ne!(
             namespace_watcher_retry_delay(3, 1),
             namespace_watcher_retry_delay(3, 2)
+
+fn pod_spec_omits_workspace_pvc_when_persistence_disabled() {
+        let params = SandboxPodParams {
+            workspace_persistence: false,
+            ..SandboxPodParams::default()
+        };
+        let cr = sandbox_to_k8s_spec(None, &params).expect("pod spec");
+        assert!(cr["spec"].get("volumeClaimTemplates").is_none());
+        assert!(
+            !cr["spec"]["podTemplate"]["spec"]["containers"][0]["volumeMounts"]
+                .as_array()
+                .is_some_and(|mounts| mounts.iter().any(|m| m["name"] == WORKSPACE_VOLUME_NAME)),
+            "workspace mount must be absent when persistence is disabled"
+        );
+    }
+
+    #[test]
+    fn pod_spec_includes_workspace_pvc_when_persistence_enabled() {
+        let cr = sandbox_to_k8s_spec(None, &SandboxPodParams::default()).expect("pod spec");
+        assert_eq!(
+            cr["spec"]["volumeClaimTemplates"][0]["metadata"]["name"],
+            WORKSPACE_VOLUME_NAME
+        );
+        assert!(
+            cr["spec"]["podTemplate"]["spec"]["containers"][0]["volumeMounts"]
+                .as_array()
+                .is_some_and(|mounts| mounts.iter().any(|m| {
+                    m["name"] == WORKSPACE_VOLUME_NAME && m["mountPath"] == WORKSPACE_MOUNT_PATH
+                }))
         );
     }
 

@@ -593,6 +593,12 @@ workspace_default_storage_size = "10Gi"
 # field, using the cluster's default StorageClass. Set this on clusters with no
 # default StorageClass, otherwise the workspace PVC stays Pending.
 # workspace_storage_class      = "fast-ssd"
+# When false, omit the default workspace PVC + /sandbox mount (Pod and VirtualMachine).
+# workspace_persistence          = true
+# Emit VirtualMachine Sandbox CRs for KubeVirt via agent-sandbox (empty or "Pod" = Pods).
+# runtime_backend                = "VirtualMachine"
+# Default OPENSHELL_SANDBOX_COMMAND for VirtualMachine sandboxes.
+# sandbox_command                = "/usr/local/bin/nemoclaw-start-vm"
 # Kubernetes RuntimeClass applied to sandbox pods when the API request does
 # not specify one. Empty (default) = omit the field, using the cluster default.
 # default_runtime_class_name   = "kata-containers"

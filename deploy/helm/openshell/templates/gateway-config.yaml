@@ -202,11 +202,18 @@ data:
     {{- if .Values.server.workspaceStorageClass }}
     workspace_storage_class      = {{ .Values.server.workspaceStorageClass | quote }}
     {{- end }}
+    workspace_persistence        = {{ .Values.server.workspacePersistence }}
     {{- if .Values.server.defaultRuntimeClassName }}
     default_runtime_class_name   = {{ .Values.server.defaultRuntimeClassName | quote }}
     {{- end }}
     {{- if .Values.server.appArmorProfile }}
     app_armor_profile            = {{ .Values.server.appArmorProfile | quote }}
+    {{- end }}
+    {{- if .Values.server.runtimeBackend }}
+    runtime_backend              = {{ .Values.server.runtimeBackend | quote }}
+    {{- end }}
+    {{- if .Values.server.sandboxCommand }}
+    sandbox_command              = {{ .Values.server.sandboxCommand | quote }}
     {{- end }}
     {{- if .Values.supervisor.image.pullPolicy }}
     supervisor_image_pull_policy = {{ include "openshell.canonicalImagePullPolicy" .Values.supervisor.image.pullPolicy | quote }}

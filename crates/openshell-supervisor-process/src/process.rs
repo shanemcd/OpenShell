@@ -2093,18 +2093,60 @@ pub fn prepare_filesystem_with_identity(
         }
     }
 
-    // Retain the existing Kubernetes/OpenShift behavior for driver-injected
-    // numeric identities. Docker clears this variable and does not receive
-    // identity-specific workspace preparation.
-    if std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok_and(|uid| !uid.is_empty()) {
-        let sandbox_home = Path::new("/sandbox");
-        if sandbox_home.exists() {
-            info!(?uid, ?gid, "Chowning /sandbox for driver-injected UID/GID");
-            chown_sandbox_home(sandbox_home, uid, gid)?;
-        }
-    }
+    // Retain Kubernetes/OpenShift behavior for driver-injected numeric
+    // identities (Docker clears SANDBOX_UID). Recursively chown /sandbox
+    // unless OPENSHELL_PRESERVE_SANDBOX_OWNERSHIP=1 opts out for sealed
+    // NemoClaw/KubeVirt guest layouts with root-owned trust anchors.
+    maybe_chown_sandbox_home(Path::new("/sandbox"), uid, gid)?;
 
     Ok(())
+}
+
+/// Whether `prepare_filesystem` should recursively chown `/sandbox`.
+///
+/// Requires [`openshell_core::sandbox_env::SANDBOX_UID`]. Skipped when
+/// [`openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP`] is `"1"`.
+#[cfg(unix)]
+fn should_recursively_chown_sandbox_home() -> bool {
+    // Docker clears SANDBOX_UID (or sets empty); only chown for driver-injected IDs.
+    if !std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok_and(|uid| !uid.is_empty()) {
+        return false;
+    }
+    match std::env::var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP) {
+        Ok(v) if v == "1" => false,
+        _ => true,
+    }
+}
+
+/// Recursively chown `sandbox_home` for driver-injected UID/GID, unless
+/// ownership preservation is requested.
+#[cfg(unix)]
+fn maybe_chown_sandbox_home(
+    sandbox_home: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+) -> Result<()> {
+    if !should_recursively_chown_sandbox_home() {
+        if std::env::var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP).as_deref()
+            == Ok("1")
+        {
+            info!(
+                path = %sandbox_home.display(),
+                "Preserving sandbox ownership (OPENSHELL_PRESERVE_SANDBOX_OWNERSHIP=1)"
+            );
+        }
+        return Ok(());
+    }
+    if !sandbox_home.exists() {
+        return Ok(());
+    }
+    info!(
+        path = %sandbox_home.display(),
+        ?uid,
+        ?gid,
+        "Chowning sandbox home for driver-injected UID/GID"
+    );
+    chown_sandbox_home(sandbox_home, uid, gid)
 }
 
 #[cfg(unix)]
@@ -4028,5 +4070,54 @@ mod tests {
             "numeric UID privilege drop child failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// Serialize env mutations across preserve-ownership tests.
+    #[cfg(unix)]
+    static PRESERVE_OWNERSHIP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    fn with_sandbox_uid_env<F: FnOnce()>(preserve: Option<&str>, f: F) {
+        let _guard = PRESERVE_OWNERSHIP_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialized by PRESERVE_OWNERSHIP_ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var(openshell_core::sandbox_env::SANDBOX_UID, "10001");
+            match preserve {
+                Some(v) => std::env::set_var(
+                    openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP,
+                    v,
+                ),
+                None => std::env::remove_var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP),
+            }
+        }
+        f();
+        unsafe {
+            std::env::remove_var(openshell_core::sandbox_env::SANDBOX_UID);
+            std::env::remove_var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_recursively_chown_sandbox_home_respects_preserve_flag() {
+        with_sandbox_uid_env(None, || {
+            assert!(should_recursively_chown_sandbox_home());
+        });
+        with_sandbox_uid_env(Some("1"), || {
+            assert!(!should_recursively_chown_sandbox_home());
+        });
+        with_sandbox_uid_env(Some("0"), || {
+            assert!(should_recursively_chown_sandbox_home());
+        });
+        let _guard = PRESERVE_OWNERSHIP_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var(openshell_core::sandbox_env::SANDBOX_UID);
+            std::env::remove_var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP);
+        }
+        assert!(!should_recursively_chown_sandbox_home());
     }
 }

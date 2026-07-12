@@ -184,6 +184,16 @@ struct Args {
     #[arg(long, env = "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET")]
     provider_spiffe_workload_api_socket_path: Option<String>,
 
+    /// Runtime backend for sandbox workloads (`Pod` or `VirtualMachine`).
+    /// When `VirtualMachine`, the driver emits agent-sandbox VirtualMachine
+    /// Sandbox CRs instead of Pods.
+    #[arg(long, env = "OPENSHELL_RUNTIME_BACKEND")]
+    runtime_backend: Option<String>,
+
+    /// Default command for VM sandboxes. Injected as OPENSHELL_SANDBOX_COMMAND.
+    #[arg(long, env = "OPENSHELL_SANDBOX_COMMAND")]
+    sandbox_command: Option<String>,
+
     #[arg(long, env = "OPENSHELL_K8S_SANDBOX_UID")]
     sandbox_uid: Option<u32>,
 
@@ -288,8 +298,17 @@ async fn main() -> Result<()> {
             }),
             workspace_storage_class: std::env::var("OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS")
                 .unwrap_or_default(),
+            workspace_persistence: match std::env::var("OPENSHELL_K8S_WORKSPACE_PERSISTENCE") {
+                Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                    "0" | "false" | "no" | "off" => false,
+                    _ => true,
+                },
+                Err(_) => true,
+            },
             default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
                 .unwrap_or_default(),
+            runtime_backend: args.runtime_backend.unwrap_or_default(),
+            sandbox_command: args.sandbox_command.unwrap_or_default(),
             sa_token_ttl_secs: args.sa_token_ttl_secs,
             provider_spiffe_workload_api_socket_path: args
                 .provider_spiffe_workload_api_socket_path

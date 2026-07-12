@@ -243,6 +243,15 @@ server:
   # StorageClass. Set this on clusters with no default StorageClass, otherwise
   # the workspace PVC stays Pending and the sandbox never starts.
   workspaceStorageClass: ""
+  # -- When true (default), inject a workspace PVC mounted at /sandbox for
+  # both Pod and VirtualMachine backends.
+  workspacePersistence: true
+  # -- Runtime backend for sandbox workloads. Set to "VirtualMachine" for
+  # KubeVirt VMs via agent-sandbox; empty or "Pod" keeps the Pod path.
+  runtimeBackend: ""
+  # -- Default command for VirtualMachine sandboxes (OPENSHELL_SANDBOX_COMMAND).
+  # Example: "/usr/local/bin/nemoclaw-start-vm"
+  sandboxCommand: ""
   # -- Default Kubernetes runtimeClassName for sandbox pods.
   # Applied when a CreateSandbox request does not specify one.
   # Empty (default) = omit the field, using the cluster's default RuntimeClass.

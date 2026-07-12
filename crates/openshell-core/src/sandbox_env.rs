@@ -235,6 +235,13 @@ pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";
 /// OCI only for the former contract.
 pub const OCI_IMAGE_USER: &str = "OPENSHELL_OCI_IMAGE_USER";
 
+/// When set to `"1"`, skip the recursive `/sandbox` chown in
+/// `prepare_filesystem`.
+///
+/// Used by KubeVirt / NemoClaw guests that seal trust anchors under
+/// root-owned paths (for example `root:sandbox` Hermes config dirs).
+pub const PRESERVE_SANDBOX_OWNERSHIP: &str = "OPENSHELL_PRESERVE_SANDBOX_OWNERSHIP";
+
 // The corporate upstream-proxy configuration deliberately has no reserved
 // environment variables: it travels on the supervisor's argv
 // (`--upstream-proxy` and friends), which a sandbox image cannot forge the
