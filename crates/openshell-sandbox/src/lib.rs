@@ -1065,11 +1065,12 @@ pub async fn run_sandbox(
             }
         }
     } else {
-        // Network-only sidecar mode: keep the proxy and its background
-        // tasks alive (held via the `networking` value) until shutdown. If the
-        // sole authenticated process-supervisor control connection closes,
-        // exit non-zero so Kubernetes restarts the network sidecar and creates
-        // a fresh one-client bootstrap listener for the restarted agent.
+        // Network-only mode: keep the proxy alive until shutdown. When a
+        // sibling workload (not spawned by this process) writes its PID to
+        // the entrypoint pid file, adopt it so L7 identity can resolve
+        // sockets via `/proc/<pid>/net/tcp` inside the sandbox netns.
+        #[cfg(target_os = "linux")]
+        spawn_entrypoint_pid_file_watcher(entrypoint_pid.clone());
         #[cfg(target_os = "linux")]
         if let Some(control_task) = sidecar_control_task {
             tokio::select! {
@@ -1174,6 +1175,85 @@ async fn wait_for_shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
         info!("Received Ctrl-C, shutting down network-only supervisor");
+    }
+}
+
+/// Watch a sibling-workload PID file and adopt it as the L7 identity anchor.
+///
+/// Combined (`network,process`) mode sets `entrypoint_pid` when spawning the
+/// child. Network-only mode has no child; the guest workload writes its PID
+/// here after entering the sandbox netns so the proxy can read
+/// `/proc/<pid>/net/tcp` for that namespace.
+#[cfg(target_os = "linux")]
+fn spawn_entrypoint_pid_file_watcher(entrypoint_pid: Arc<AtomicU32>) {
+    let path = std::env::var(openshell_core::sandbox_env::ENTRYPOINT_PID_FILE)
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/run/openshell/entrypoint.pid"));
+
+    tokio::spawn(async move {
+        let mut last = 0_u32;
+        let mut logged_waiting = false;
+        loop {
+            match read_live_entrypoint_pid(&path) {
+                Ok(Some(pid)) if pid != last => {
+                    entrypoint_pid.store(pid, std::sync::atomic::Ordering::Release);
+                    last = pid;
+                    info!(
+                        pid,
+                        path = %path.display(),
+                        "Adopted sibling entrypoint PID from pid file"
+                    );
+                }
+                Ok(None) if last != 0 => {
+                    // Workload exited; clear so new connections deny until respawn.
+                    entrypoint_pid.store(0, std::sync::atomic::Ordering::Release);
+                    last = 0;
+                    info!(
+                        path = %path.display(),
+                        "Sibling entrypoint PID cleared (process gone)"
+                    );
+                    logged_waiting = false;
+                }
+                Ok(None) if !logged_waiting => {
+                    info!(
+                        path = %path.display(),
+                        "Waiting for sibling entrypoint PID file"
+                    );
+                    logged_waiting = true;
+                }
+                Err(err) => {
+                    debug!(
+                        error = %err,
+                        path = %path.display(),
+                        "Failed to read sibling entrypoint PID file"
+                    );
+                }
+                _ => {}
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn read_live_entrypoint_pid(path: &std::path::Path) -> std::io::Result<Option<u32>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let pid: u32 = match raw.trim().parse() {
+        Ok(pid) if pid > 1 => pid,
+        _ => return Ok(None),
+    };
+    // Confirm the process still exists (and is not a recycled stale PID alone —
+    // best-effort; netns identity binding still validates socket ownership).
+    if std::path::Path::new(&format!("/proc/{pid}")).is_dir() {
+        Ok(Some(pid))
+    } else {
+        Ok(None)
     }
 }
 

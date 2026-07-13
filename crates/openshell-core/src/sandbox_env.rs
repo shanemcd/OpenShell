@@ -244,6 +244,19 @@ pub const OCI_IMAGE_USER: &str = "OPENSHELL_OCI_IMAGE_USER";
 /// OpenShell owns `/sandbox`, then step down via `setpriv`/`capsh`.
 pub const DEFER_PRIVILEGE_DROP: &str = "OPENSHELL_DEFER_PRIVILEGE_DROP";
 
+/// Path where a sibling workload (network-only topology) publishes the
+/// entrypoint PID for L7 identity binding.
+///
+/// When the process leaf is not running, `entrypoint_pid` stays 0 and the
+/// proxy cannot resolve `/proc/<pid>/net/tcp` inside the sandbox netns.
+/// Network-only mode watches this file (default `/run/openshell/entrypoint.pid`)
+/// and stores the PID once a live process appears.
+pub const ENTRYPOINT_PID_FILE: &str = "OPENSHELL_ENTRYPOINT_PID_FILE";
+
+/// Path where the network leaf publishes the sandbox netns filesystem path
+/// for sibling workloads (`nsenter --net=...`). Default `/run/openshell/netns`.
+pub const NETNS_FILE: &str = "OPENSHELL_NETNS_FILE";
+
 // The corporate upstream-proxy configuration deliberately has no reserved
 // environment variables: it travels on the supervisor's argv
 // (`--upstream-proxy` and friends), which a sandbox image cannot forge the

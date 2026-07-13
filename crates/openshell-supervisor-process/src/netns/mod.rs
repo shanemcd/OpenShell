@@ -210,6 +210,12 @@ impl NetworkNamespace {
         &self.name
     }
 
+    /// Filesystem path for this netns (`/var/run/netns/<name>`).
+    #[must_use]
+    pub fn path(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("/var/run/netns/{}", self.name))
+    }
+
     /// Enter this network namespace.
     ///
     /// Must be called from the child process after fork, before exec.
@@ -610,6 +616,7 @@ pub fn create_netns_for_proxy(
     }
     match NetworkNamespace::create() {
         Ok(ns) => {
+            publish_netns_path(&ns);
             let proxy_port = policy
                 .network
                 .proxy
@@ -635,6 +642,37 @@ pub fn create_netns_for_proxy(
              Ensure CAP_NET_ADMIN and CAP_SYS_ADMIN are available and iproute2 is installed. \
              Error: {e}"
         )),
+    }
+}
+
+/// Publish the sandbox netns path for sibling workloads (network-only topology).
+fn publish_netns_path(ns: &NetworkNamespace) {
+    let path = std::env::var(openshell_core::sandbox_env::NETNS_FILE)
+        .ok()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "/run/openshell/netns".to_string());
+    let ns_path = ns.path();
+    if let Some(parent) = Path::new(&path).parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        warn!(
+            error = %err,
+            path = %parent.display(),
+            "Failed to create directory for netns path publish"
+        );
+        return;
+    }
+    match std::fs::write(&path, format!("{}\n", ns_path.display())) {
+        Ok(()) => debug!(
+            path = %path,
+            netns = %ns_path.display(),
+            "Published sandbox netns path for sibling workloads"
+        ),
+        Err(err) => warn!(
+            error = %err,
+            path = %path,
+            "Failed to publish sandbox netns path"
+        ),
     }
 }
 
