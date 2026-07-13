@@ -235,12 +235,14 @@ pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";
 /// OCI only for the former contract.
 pub const OCI_IMAGE_USER: &str = "OPENSHELL_OCI_IMAGE_USER";
 
-/// When set to `"1"`, skip the recursive `/sandbox` chown in
-/// `prepare_filesystem`.
+/// When set to `"1"`, the process supervisor skips `setuid`/`setgid` in the
+/// sandbox command's `pre_exec` hook so the entrypoint starts as root (after
+/// `prepare_filesystem` chown), applies Landlock/seccomp, and must drop
+/// privileges itself — matching container `ENTRYPOINT` behavior.
 ///
-/// Used by KubeVirt / NemoClaw guests that seal trust anchors under
-/// root-owned paths (for example `root:sandbox` Hermes config dirs).
-pub const PRESERVE_SANDBOX_OWNERSHIP: &str = "OPENSHELL_PRESERVE_SANDBOX_OWNERSHIP";
+/// Used by KubeVirt / NemoClaw guests that seal trust anchors as root after
+/// OpenShell owns `/sandbox`, then step down via `setpriv`/`capsh`.
+pub const DEFER_PRIVILEGE_DROP: &str = "OPENSHELL_DEFER_PRIVILEGE_DROP";
 
 // The corporate upstream-proxy configuration deliberately has no reserved
 // environment variables: it travels on the supervisor's argv
