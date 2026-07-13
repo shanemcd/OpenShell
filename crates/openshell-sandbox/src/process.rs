@@ -108,6 +108,31 @@ impl ResolvedWorkspace {
     }
 }
 
+impl ProcessEnforcementMode {
+    #[must_use]
+    pub const fn uses_privileged_process_setup(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    #[must_use]
+    pub const fn enforces_child_sandbox(self) -> bool {
+        matches!(self, Self::Full | Self::NetworkOnly)
+    }
+}
+
+/// Whether Full-mode spawn should `drop_privileges` in `pre_exec` before exec.
+///
+/// Returns false when [`openshell_core::sandbox_env::DEFER_PRIVILEGE_DROP`] is
+/// `"1"` so the entrypoint can start as root (seal, then self-drop). SSH
+/// session spawns do not consult this helper.
+#[must_use]
+pub fn should_drop_privileges_before_exec() -> bool {
+    match std::env::var(openshell_core::sandbox_env::DEFER_PRIVILEGE_DROP) {
+        Ok(v) if v == "1" => false,
+        _ => true,
+    }
+}
+ de45cc60 (Defer sandbox entrypoint privilege drop for root self-seal guests.):crates/openshell-supervisor-process/src/process.rs
 #[cfg(target_os = "linux")]
 pub(crate) fn prepare_child_sandbox(
     policy: &SandboxPolicy,
@@ -627,11 +652,34 @@ impl ProcessHandle {
                         return Err(std::io::Error::last_os_error());
                     }
 
+// Enter network namespace before applying other restrictions.
+                    if let Some(fd) = netns_fd {
+                        let result = libc::setns(fd, libc::CLONE_NEWNET);
+                        if result != 0 {
+                            return Err(std::io::Error::other(format!(
+                                "failed to enter network namespace: {}",
+                                std::io::Error::last_os_error()
+                            )));
+                        }
+                    }
+
+                    // Drop privileges unless the guest opted into a root
+                    // entrypoint (OPENSHELL_DEFER_PRIVILEGE_DROP=1). initgroups/
+                    // setgid/setuid need /etc/group and /etc/passwd which would
+                    // be blocked if Landlock were already enforced.
+                    if enforcement_mode.uses_privileged_process_setup()
+                        && should_drop_privileges_before_exec()
+                    {
+                        drop_privileges_with_identity(&policy, resolved_identity)
+                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    }
+ de45cc60 (Defer sandbox entrypoint privilege drop for root self-seal guests.):crates/openshell-supervisor-process/src/process.rs
                     harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
 
-                    // Phase 2 (as unprivileged user): Enforce the prepared
-                    // Landlock ruleset via restrict_self() + apply seccomp.
-                    // restrict_self() does not require root.
+                    // Phase 2: Enforce the prepared Landlock ruleset via
+                    // restrict_self() + apply seccomp. restrict_self() does
+                    // not require root (and also works when the entrypoint
+                    // remains root under DEFER_PRIVILEGE_DROP).
                     #[cfg(target_os = "linux")]
                     if let Some(prepared) = prepared_sandbox.take() {
                         sandbox::linux::enforce_capability_free(prepared, &mut child_hardening)
@@ -647,6 +695,14 @@ impl ProcessHandle {
         // here is otherwise indistinguishable from a missing working directory
         // or interpreter, and is a common failure on images that lack the
         // requested shell/binary (e.g. bash on Alpine).
+        if enforcement_mode.uses_privileged_process_setup()
+            && !should_drop_privileges_before_exec()
+        {
+            info!(
+                program,
+                "Deferring privilege drop: entrypoint starts as root and must drop itself"
+            );
+        }
         #[cfg(target_os = "linux")]
         let mut child_registry = managed_children::lock();
         #[cfg(target_os = "linux")]
@@ -773,6 +829,15 @@ impl ProcessHandle {
                         return Err(std::io::Error::last_os_error());
                     }
 
+// Drop privileges before applying sandbox restrictions
+                    // unless OPENSHELL_DEFER_PRIVILEGE_DROP=1.
+                    if enforcement_mode.uses_privileged_process_setup()
+                        && should_drop_privileges_before_exec()
+                    {
+                        drop_privileges_with_identity(&policy, resolved_identity)
+                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    }
+ de45cc60 (Defer sandbox entrypoint privilege drop for root self-seal guests.):crates/openshell-supervisor-process/src/process.rs
                     harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
                     sandbox::apply(&policy, workdir.as_deref())
                         .map_err(|err| std::io::Error::other(err.to_string()))?;
@@ -780,6 +845,15 @@ impl ProcessHandle {
                     Ok(())
                 });
             }
+        }
+
+        if enforcement_mode.uses_privileged_process_setup()
+            && !should_drop_privileges_before_exec()
+        {
+            info!(
+                program,
+                "Deferring privilege drop: entrypoint starts as root and must drop itself"
+            );
         }
 
         let mut child = cmd.spawn().into_diagnostic()?;
@@ -1846,60 +1920,19 @@ pub fn prepare_filesystem_with_identity(
         }
     }
 
-    // Retain Kubernetes/OpenShift behavior for driver-injected numeric
-    // identities (Docker clears SANDBOX_UID). Recursively chown /sandbox
-    // unless OPENSHELL_PRESERVE_SANDBOX_OWNERSHIP=1 opts out for sealed
-    // NemoClaw/KubeVirt guest layouts with root-owned trust anchors.
-    maybe_chown_sandbox_home(Path::new("/sandbox"), uid, gid)?;
+    // Retain the existing Kubernetes/OpenShift behavior for driver-injected
+    // numeric identities. Docker clears this variable and does not receive
+    // identity-specific workspace preparation. Under DEFER_PRIVILEGE_DROP the
+    // entrypoint stays root after this chown so it can seal trust anchors.
+    if std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok_and(|uid| !uid.is_empty()) {
+        let sandbox_home = Path::new("/sandbox");
+        if sandbox_home.exists() {
+            info!(?uid, ?gid, "Chowning /sandbox for driver-injected UID/GID");
+            chown_sandbox_home(sandbox_home, uid, gid)?;
+        }
+    }
 
     Ok(())
-}
-
-/// Whether `prepare_filesystem` should recursively chown `/sandbox`.
-///
-/// Requires [`openshell_core::sandbox_env::SANDBOX_UID`]. Skipped when
-/// [`openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP`] is `"1"`.
-#[cfg(unix)]
-fn should_recursively_chown_sandbox_home() -> bool {
-    // Docker clears SANDBOX_UID (or sets empty); only chown for driver-injected IDs.
-    if !std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok_and(|uid| !uid.is_empty()) {
-        return false;
-    }
-    match std::env::var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP) {
-        Ok(v) if v == "1" => false,
-        _ => true,
-    }
-}
-
-/// Recursively chown `sandbox_home` for driver-injected UID/GID, unless
-/// ownership preservation is requested.
-#[cfg(unix)]
-fn maybe_chown_sandbox_home(
-    sandbox_home: &Path,
-    uid: Option<Uid>,
-    gid: Option<Gid>,
-) -> Result<()> {
-    if !should_recursively_chown_sandbox_home() {
-        if std::env::var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP).as_deref()
-            == Ok("1")
-        {
-            info!(
-                path = %sandbox_home.display(),
-                "Preserving sandbox ownership (OPENSHELL_PRESERVE_SANDBOX_OWNERSHIP=1)"
-            );
-        }
-        return Ok(());
-    }
-    if !sandbox_home.exists() {
-        return Ok(());
-    }
-    info!(
-        path = %sandbox_home.display(),
-        ?uid,
-        ?gid,
-        "Chowning sandbox home for driver-injected UID/GID"
-    );
-    chown_sandbox_home(sandbox_home, uid, gid)
 }
 
 #[cfg(unix)]
@@ -2414,6 +2447,56 @@ mod tests {
         assert!(validate_sandbox_group_with_identity(&policy, resolved).is_ok());
     }
 
+#[test]
+    fn full_enforcement_uses_privileged_setup_and_child_sandbox() {
+        assert!(ProcessEnforcementMode::Full.uses_privileged_process_setup());
+        assert!(ProcessEnforcementMode::Full.enforces_child_sandbox());
+    }
+
+    #[test]
+    fn network_only_enforcement_keeps_child_sandbox_without_privileged_setup() {
+        assert!(!ProcessEnforcementMode::NetworkOnly.uses_privileged_process_setup());
+        assert!(ProcessEnforcementMode::NetworkOnly.enforces_child_sandbox());
+    }
+
+    /// Serialize env mutations across defer-privilege-drop tests.
+    static DEFER_PRIVILEGE_DROP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_defer_privilege_drop_env<F: FnOnce()>(value: Option<&str>, f: F) {
+        let _guard = DEFER_PRIVILEGE_DROP_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialized by DEFER_PRIVILEGE_DROP_ENV_LOCK; restored below.
+        #[allow(unsafe_code)]
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(
+                    openshell_core::sandbox_env::DEFER_PRIVILEGE_DROP,
+                    v,
+                ),
+                None => std::env::remove_var(openshell_core::sandbox_env::DEFER_PRIVILEGE_DROP),
+            }
+        }
+        f();
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var(openshell_core::sandbox_env::DEFER_PRIVILEGE_DROP);
+        }
+    }
+
+    #[test]
+    fn should_drop_privileges_before_exec_respects_defer_flag() {
+        with_defer_privilege_drop_env(None, || {
+            assert!(should_drop_privileges_before_exec());
+        });
+        with_defer_privilege_drop_env(Some("1"), || {
+            assert!(!should_drop_privileges_before_exec());
+        });
+        with_defer_privilege_drop_env(Some("0"), || {
+            assert!(should_drop_privileges_before_exec());
+        });
+    }
+ de45cc60 (Defer sandbox entrypoint privilege drop for root self-seal guests.):crates/openshell-supervisor-process/src/process.rs
     #[cfg(target_os = "linux")]
     fn capability_bounding_set_clear_available() -> bool {
         capctl::caps::CapState::get_current()
@@ -3948,54 +4031,5 @@ mod tests {
             "numeric UID privilege drop child failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-    }
-
-    /// Serialize env mutations across preserve-ownership tests.
-    #[cfg(unix)]
-    static PRESERVE_OWNERSHIP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[cfg(unix)]
-    fn with_sandbox_uid_env<F: FnOnce()>(preserve: Option<&str>, f: F) {
-        let _guard = PRESERVE_OWNERSHIP_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // SAFETY: serialized by PRESERVE_OWNERSHIP_ENV_LOCK; restored below.
-        unsafe {
-            std::env::set_var(openshell_core::sandbox_env::SANDBOX_UID, "10001");
-            match preserve {
-                Some(v) => std::env::set_var(
-                    openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP,
-                    v,
-                ),
-                None => std::env::remove_var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP),
-            }
-        }
-        f();
-        unsafe {
-            std::env::remove_var(openshell_core::sandbox_env::SANDBOX_UID);
-            std::env::remove_var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP);
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn should_recursively_chown_sandbox_home_respects_preserve_flag() {
-        with_sandbox_uid_env(None, || {
-            assert!(should_recursively_chown_sandbox_home());
-        });
-        with_sandbox_uid_env(Some("1"), || {
-            assert!(!should_recursively_chown_sandbox_home());
-        });
-        with_sandbox_uid_env(Some("0"), || {
-            assert!(should_recursively_chown_sandbox_home());
-        });
-        let _guard = PRESERVE_OWNERSHIP_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::remove_var(openshell_core::sandbox_env::SANDBOX_UID);
-            std::env::remove_var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP);
-        }
-        assert!(!should_recursively_chown_sandbox_home());
     }
 }
