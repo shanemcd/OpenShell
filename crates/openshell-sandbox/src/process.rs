@@ -66,6 +66,31 @@ impl ResolvedWorkspace {
     }
 }
 
+impl ProcessEnforcementMode {
+    #[must_use]
+    pub const fn uses_privileged_process_setup(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    #[must_use]
+    pub const fn enforces_child_sandbox(self) -> bool {
+        matches!(self, Self::Full | Self::NetworkOnly)
+    }
+}
+
+/// Whether Full-mode spawn should `drop_privileges` in `pre_exec` before exec.
+///
+/// Returns false when [`openshell_core::sandbox_env::DEFER_PRIVILEGE_DROP`] is
+/// `"1"` so the entrypoint can start as root (seal, then self-drop). SSH
+/// session spawns do not consult this helper.
+#[must_use]
+pub fn should_drop_privileges_before_exec() -> bool {
+    match std::env::var(openshell_core::sandbox_env::DEFER_PRIVILEGE_DROP) {
+        Ok(v) if v == "1" => false,
+        _ => true,
+    }
+}
+ de45cc60 (Defer sandbox entrypoint privilege drop for root self-seal guests.):crates/openshell-supervisor-process/src/process.rs
 #[cfg(target_os = "linux")]
 pub(crate) fn prepare_child_sandbox(
     policy: &SandboxPolicy,
@@ -545,11 +570,34 @@ impl ProcessHandle {
                         return Err(std::io::Error::last_os_error());
                     }
 
+// Enter network namespace before applying other restrictions.
+                    if let Some(fd) = netns_fd {
+                        let result = libc::setns(fd, libc::CLONE_NEWNET);
+                        if result != 0 {
+                            return Err(std::io::Error::other(format!(
+                                "failed to enter network namespace: {}",
+                                std::io::Error::last_os_error()
+                            )));
+                        }
+                    }
+
+                    // Drop privileges unless the guest opted into a root
+                    // entrypoint (OPENSHELL_DEFER_PRIVILEGE_DROP=1). initgroups/
+                    // setgid/setuid need /etc/group and /etc/passwd which would
+                    // be blocked if Landlock were already enforced.
+                    if enforcement_mode.uses_privileged_process_setup()
+                        && should_drop_privileges_before_exec()
+                    {
+                        drop_privileges_with_identity(&policy, resolved_identity)
+                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    }
+ de45cc60 (Defer sandbox entrypoint privilege drop for root self-seal guests.):crates/openshell-supervisor-process/src/process.rs
                     harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
 
-                    // Phase 2 (as unprivileged user): Enforce the prepared
-                    // Landlock ruleset via restrict_self() + apply seccomp.
-                    // restrict_self() does not require root.
+                    // Phase 2: Enforce the prepared Landlock ruleset via
+                    // restrict_self() + apply seccomp. restrict_self() does
+                    // not require root (and also works when the entrypoint
+                    // remains root under DEFER_PRIVILEGE_DROP).
                     #[cfg(target_os = "linux")]
                     if let Some(prepared) = prepared_sandbox.take() {
                         sandbox::linux::enforce_capability_free(prepared, &mut child_hardening)
@@ -565,6 +613,14 @@ impl ProcessHandle {
         // here is otherwise indistinguishable from a missing working directory
         // or interpreter, and is a common failure on images that lack the
         // requested shell/binary (e.g. bash on Alpine).
+        if enforcement_mode.uses_privileged_process_setup()
+            && !should_drop_privileges_before_exec()
+        {
+            info!(
+                program,
+                "Deferring privilege drop: entrypoint starts as root and must drop itself"
+            );
+        }
         #[cfg(target_os = "linux")]
         let mut child_registry = managed_children::lock();
         #[cfg(target_os = "linux")]
@@ -691,6 +747,15 @@ impl ProcessHandle {
                         return Err(std::io::Error::last_os_error());
                     }
 
+// Drop privileges before applying sandbox restrictions
+                    // unless OPENSHELL_DEFER_PRIVILEGE_DROP=1.
+                    if enforcement_mode.uses_privileged_process_setup()
+                        && should_drop_privileges_before_exec()
+                    {
+                        drop_privileges_with_identity(&policy, resolved_identity)
+                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    }
+ de45cc60 (Defer sandbox entrypoint privilege drop for root self-seal guests.):crates/openshell-supervisor-process/src/process.rs
                     harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
                     sandbox::apply(&policy, workdir.as_deref())
                         .map_err(|err| std::io::Error::other(err.to_string()))?;
@@ -698,6 +763,15 @@ impl ProcessHandle {
                     Ok(())
                 });
             }
+        }
+
+        if enforcement_mode.uses_privileged_process_setup()
+            && !should_drop_privileges_before_exec()
+        {
+            info!(
+                program,
+                "Deferring privilege drop: entrypoint starts as root and must drop itself"
+            );
         }
 
         let mut child = cmd.spawn().into_diagnostic()?;
@@ -1192,60 +1266,19 @@ pub fn prepare_filesystem_with_identity(
         }
     }
 
-    // Retain Kubernetes/OpenShift behavior for driver-injected numeric
-    // identities (Docker clears SANDBOX_UID). Recursively chown /sandbox
-    // unless OPENSHELL_PRESERVE_SANDBOX_OWNERSHIP=1 opts out for sealed
-    // NemoClaw/KubeVirt guest layouts with root-owned trust anchors.
-    maybe_chown_sandbox_home(Path::new("/sandbox"), uid, gid)?;
+    // Retain the existing Kubernetes/OpenShift behavior for driver-injected
+    // numeric identities. Docker clears this variable and does not receive
+    // identity-specific workspace preparation. Under DEFER_PRIVILEGE_DROP the
+    // entrypoint stays root after this chown so it can seal trust anchors.
+    if std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok_and(|uid| !uid.is_empty()) {
+        let sandbox_home = Path::new("/sandbox");
+        if sandbox_home.exists() {
+            info!(?uid, ?gid, "Chowning /sandbox for driver-injected UID/GID");
+            chown_sandbox_home(sandbox_home, uid, gid)?;
+        }
+    }
 
     Ok(())
-}
-
-/// Whether `prepare_filesystem` should recursively chown `/sandbox`.
-///
-/// Requires [`openshell_core::sandbox_env::SANDBOX_UID`]. Skipped when
-/// [`openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP`] is `"1"`.
-#[cfg(unix)]
-fn should_recursively_chown_sandbox_home() -> bool {
-    // Docker clears SANDBOX_UID (or sets empty); only chown for driver-injected IDs.
-    if !std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok_and(|uid| !uid.is_empty()) {
-        return false;
-    }
-    match std::env::var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP) {
-        Ok(v) if v == "1" => false,
-        _ => true,
-    }
-}
-
-/// Recursively chown `sandbox_home` for driver-injected UID/GID, unless
-/// ownership preservation is requested.
-#[cfg(unix)]
-fn maybe_chown_sandbox_home(
-    sandbox_home: &Path,
-    uid: Option<Uid>,
-    gid: Option<Gid>,
-) -> Result<()> {
-    if !should_recursively_chown_sandbox_home() {
-        if std::env::var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP).as_deref()
-            == Ok("1")
-        {
-            info!(
-                path = %sandbox_home.display(),
-                "Preserving sandbox ownership (OPENSHELL_PRESERVE_SANDBOX_OWNERSHIP=1)"
-            );
-        }
-        return Ok(());
-    }
-    if !sandbox_home.exists() {
-        return Ok(());
-    }
-    info!(
-        path = %sandbox_home.display(),
-        ?uid,
-        ?gid,
-        "Chowning sandbox home for driver-injected UID/GID"
-    );
-    chown_sandbox_home(sandbox_home, uid, gid)
 }
 
 #[cfg(unix)]
@@ -1684,6 +1717,383 @@ mod tests {
             );
             assert_eq!(variables.get("HOME"), Some(&"/sandbox"));
         }
+    }
+
+    /// Unknown names may yield `Ok(None)` (`… not found …`) or `Err` when NSS fails first
+    /// (e.g. `ENOENT: No such file or directory`).
+    fn assert_unknown_identity_lookup_failed(msg: &str) {
+        assert!(
+            msg.contains("not found")
+                || msg.contains("ENOENT")
+                || msg.contains("No such file or directory"),
+            "expected unknown user/group lookup failure (…not found… or ENOENT): {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn explicit_identity_accepts_non_root_system_ids() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("101".into()),
+            run_as_group: Some("102".into()),
+        });
+
+        assert!(validate_sandbox_user(&policy).is_ok());
+        assert!(validate_sandbox_group(&policy).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolved_oci_identity_accepts_non_root_system_ids() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("app".into()),
+            run_as_group: Some("staff".into()),
+        });
+        let resolved = ResolvedProcessIdentity::new(Some(101), Some(102));
+
+        assert!(validate_sandbox_user_with_identity(&policy, resolved).is_ok());
+        assert!(validate_sandbox_group_with_identity(&policy, resolved).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn completed_runtime_identity_rejects_numeric_root() {
+        let root_user = policy_with_process(ProcessPolicy {
+            run_as_user: Some("0".into()),
+            run_as_group: Some("102".into()),
+        });
+        let root_group = policy_with_process(ProcessPolicy {
+            run_as_user: Some("101".into()),
+            run_as_group: Some("0".into()),
+        });
+
+        assert!(validate_sandbox_user(&root_user).is_err());
+        assert!(validate_sandbox_group(&root_group).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolved_oci_components_do_not_repeat_nss_validation() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("__oci_name_not_in_host_nss__".into()),
+            run_as_group: Some("__oci_group_not_in_host_nss__".into()),
+        });
+        let resolved = ResolvedProcessIdentity::new(Some(1234), Some(1235));
+
+        assert!(validate_sandbox_user_with_identity(&policy, resolved).is_ok());
+        assert!(validate_sandbox_group_with_identity(&policy, resolved).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn explicit_policy_components_keep_existing_validation_path() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("__explicit_name_not_in_host_nss__".into()),
+            run_as_group: Some("__oci_group_not_in_host_nss__".into()),
+        });
+        let resolved = ResolvedProcessIdentity::new(None, Some(1235));
+
+        assert!(validate_sandbox_user_with_identity(&policy, resolved).is_err());
+        assert!(validate_sandbox_group_with_identity(&policy, resolved).is_ok());
+    }
+
+#[test]
+    fn full_enforcement_uses_privileged_setup_and_child_sandbox() {
+        assert!(ProcessEnforcementMode::Full.uses_privileged_process_setup());
+        assert!(ProcessEnforcementMode::Full.enforces_child_sandbox());
+    }
+
+    #[test]
+    fn network_only_enforcement_keeps_child_sandbox_without_privileged_setup() {
+        assert!(!ProcessEnforcementMode::NetworkOnly.uses_privileged_process_setup());
+        assert!(ProcessEnforcementMode::NetworkOnly.enforces_child_sandbox());
+    }
+
+    /// Serialize env mutations across defer-privilege-drop tests.
+    static DEFER_PRIVILEGE_DROP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_defer_privilege_drop_env<F: FnOnce()>(value: Option<&str>, f: F) {
+        let _guard = DEFER_PRIVILEGE_DROP_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // SAFETY: serialized by DEFER_PRIVILEGE_DROP_ENV_LOCK; restored below.
+        #[allow(unsafe_code)]
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(
+                    openshell_core::sandbox_env::DEFER_PRIVILEGE_DROP,
+                    v,
+                ),
+                None => std::env::remove_var(openshell_core::sandbox_env::DEFER_PRIVILEGE_DROP),
+            }
+        }
+        f();
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var(openshell_core::sandbox_env::DEFER_PRIVILEGE_DROP);
+        }
+    }
+
+    #[test]
+    fn should_drop_privileges_before_exec_respects_defer_flag() {
+        with_defer_privilege_drop_env(None, || {
+            assert!(should_drop_privileges_before_exec());
+        });
+        with_defer_privilege_drop_env(Some("1"), || {
+            assert!(!should_drop_privileges_before_exec());
+        });
+        with_defer_privilege_drop_env(Some("0"), || {
+            assert!(should_drop_privileges_before_exec());
+        });
+    }
+ de45cc60 (Defer sandbox entrypoint privilege drop for root self-seal guests.):crates/openshell-supervisor-process/src/process.rs
+    #[cfg(target_os = "linux")]
+    fn capability_bounding_set_clear_available() -> bool {
+        capctl::caps::CapState::get_current()
+            .is_ok_and(|state| state.effective.has(capctl::caps::Cap::SETPCAP))
+            || capctl::caps::bounding::probe().is_empty()
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn capability_bounding_set_clear_accepts_empty_eperm() {
+        let remaining = capctl::caps::CapSet::empty();
+
+        assert!(
+            validate_capability_bounding_set_clear(
+                Err(capctl::Error::from_code(libc::EPERM)),
+                remaining,
+                || Ok(()),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn capability_bounding_set_clear_rejects_nonempty_eperm() {
+        let mut remaining = capctl::caps::CapSet::empty();
+        remaining.add(capctl::caps::Cap::CHOWN);
+
+        let result = validate_capability_bounding_set_clear(
+            Err(capctl::Error::from_code(libc::EPERM)),
+            remaining,
+            || panic!("unknown capabilities should not be checked when known caps remain"),
+        );
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to clear child capability bounding set")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn capability_bounding_set_clear_rejects_nonempty_success() {
+        let mut remaining = capctl::caps::CapSet::empty();
+        remaining.add(capctl::caps::Cap::CHOWN);
+
+        let result = validate_capability_bounding_set_clear(Ok(()), remaining, || {
+            panic!("unknown capabilities should not be checked when known caps remain")
+        });
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("capabilities remain raised")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn capability_bounding_set_clear_rejects_unknown_eperm() {
+        let remaining = capctl::caps::CapSet::empty();
+
+        let result = validate_capability_bounding_set_clear(
+            Err(capctl::Error::from_code(libc::EPERM)),
+            remaining,
+            || Err(capctl::Error::from_code(libc::EPERM)),
+        );
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to clear unknown child capability bounding set entries")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn capability_probe_child() {
+        if std::env::var_os("OPENSHELL_TEST_PROBE_CHILD_CAPS").is_none() {
+            return;
+        }
+
+        assert!(
+            capctl::caps::bounding::probe().is_empty(),
+            "child CapBnd should be empty after exec"
+        );
+    }
+
+    #[test]
+    fn drop_privileges_noop_when_no_user_or_group() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: None,
+            run_as_group: None,
+        });
+        if nix::unistd::geteuid().is_root() {
+            // As root, drop_privileges falls back to "sandbox:sandbox".
+            // If that user exists, it succeeds; if not (e.g. CI), it
+            // must error rather than silently keep root.
+            let has_sandbox = User::from_name("sandbox").ok().flatten().is_some();
+            assert_eq!(drop_privileges(&policy).is_ok(), has_sandbox);
+        } else {
+            assert!(drop_privileges(&policy).is_ok());
+        }
+    }
+
+    #[test]
+    fn drop_privileges_noop_when_empty_strings() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(String::new()),
+            run_as_group: Some(String::new()),
+        });
+        if nix::unistd::geteuid().is_root() {
+            let has_sandbox = User::from_name("sandbox").ok().flatten().is_some();
+            assert_eq!(drop_privileges(&policy).is_ok(), has_sandbox);
+        } else {
+            assert!(drop_privileges(&policy).is_ok());
+        }
+    }
+
+    #[test]
+    fn drop_privileges_succeeds_for_current_group() {
+        // Set only run_as_group (no run_as_user) so that initgroups() is not
+        // called.  initgroups(3) requires CAP_SETGID/root even when the target
+        // is the current user, so it cannot be exercised without elevated
+        // privileges.  This test covers the setgid() + GID post-condition
+        // verification path without needing root.
+        let current_group = Group::from_gid(nix::unistd::getegid())
+            .expect("getgrgid")
+            .expect("current group entry");
+
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: None,
+            run_as_group: Some(current_group.name),
+        });
+
+        let result = drop_privileges(&policy);
+        #[cfg(target_os = "linux")]
+        {
+            if nix::unistd::geteuid().is_root() && !capability_bounding_set_clear_available() {
+                let msg = format!("{}", result.unwrap_err());
+                assert!(
+                    msg.contains("Failed to clear child capability bounding set"),
+                    "unexpected failure: {msg}"
+                );
+                return;
+            }
+        }
+        assert!(result.is_ok(), "drop_privileges failed: {result:?}");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    fn drop_privileges_clears_bounding_set_for_spawned_child_when_permitted() {
+        use std::os::unix::process::CommandExt;
+
+        if !capability_bounding_set_clear_available() {
+            eprintln!(
+                "skipping: CAP_SETPCAP is not effective and the capability bounding set is nonempty"
+            );
+            return;
+        }
+
+        let current_group = Group::from_gid(nix::unistd::getegid())
+            .expect("getgrgid")
+            .expect("current group entry");
+
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: None,
+            run_as_group: Some(current_group.name),
+        });
+
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current exe"));
+        cmd.arg("capability_probe_child")
+            .arg("--nocapture")
+            .env("OPENSHELL_TEST_PROBE_CHILD_CAPS", "1")
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::piped());
+
+        unsafe {
+            cmd.pre_exec(move || {
+                drop_privileges(&policy).map_err(|err| std::io::Error::other(err.to_string()))
+            });
+        }
+
+        let output = cmd.output().expect("spawn child status probe");
+        assert!(
+            output.status.success(),
+            "status probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "initgroups(3) requires CAP_SETGID; run as root: sudo cargo test -- --ignored"]
+    fn drop_privileges_succeeds_for_current_user() {
+        // Exercises the full privilege-drop path including initgroups(),
+        // setgid(), setuid(), and the root-reacquisition check.  Requires
+        // CAP_SETGID (root) because initgroups(3) calls setgroups(2)
+        // internally.  Fixes: https://github.com/NVIDIA/OpenShell/issues/622
+        let current_user = User::from_uid(nix::unistd::geteuid())
+            .expect("getpwuid")
+            .expect("current user entry");
+        let current_group = Group::from_gid(nix::unistd::getegid())
+            .expect("getgrgid")
+            .expect("current group entry");
+
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(current_user.name),
+            run_as_group: Some(current_group.name),
+        });
+
+        assert!(drop_privileges(&policy).is_ok());
+    }
+
+    #[test]
+    fn drop_privileges_fails_for_nonexistent_user() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("__nonexistent_test_user_42__".to_string()),
+            run_as_group: None,
+        });
+
+        let result = drop_privileges(&policy);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert_unknown_identity_lookup_failed(&msg);
+    }
+
+    #[test]
+    fn drop_privileges_fails_for_nonexistent_group() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: None,
+            run_as_group: Some("__nonexistent_test_group_42__".to_string()),
+        });
+
+        let result = drop_privileges(&policy);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert_unknown_identity_lookup_failed(&msg);
     }
 
     #[cfg(unix)]
@@ -2231,54 +2641,5 @@ mod tests {
             "numeric UID privilege drop child failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-    }
-
-    /// Serialize env mutations across preserve-ownership tests.
-    #[cfg(unix)]
-    static PRESERVE_OWNERSHIP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[cfg(unix)]
-    fn with_sandbox_uid_env<F: FnOnce()>(preserve: Option<&str>, f: F) {
-        let _guard = PRESERVE_OWNERSHIP_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // SAFETY: serialized by PRESERVE_OWNERSHIP_ENV_LOCK; restored below.
-        unsafe {
-            std::env::set_var(openshell_core::sandbox_env::SANDBOX_UID, "10001");
-            match preserve {
-                Some(v) => std::env::set_var(
-                    openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP,
-                    v,
-                ),
-                None => std::env::remove_var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP),
-            }
-        }
-        f();
-        unsafe {
-            std::env::remove_var(openshell_core::sandbox_env::SANDBOX_UID);
-            std::env::remove_var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP);
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn should_recursively_chown_sandbox_home_respects_preserve_flag() {
-        with_sandbox_uid_env(None, || {
-            assert!(should_recursively_chown_sandbox_home());
-        });
-        with_sandbox_uid_env(Some("1"), || {
-            assert!(!should_recursively_chown_sandbox_home());
-        });
-        with_sandbox_uid_env(Some("0"), || {
-            assert!(should_recursively_chown_sandbox_home());
-        });
-        let _guard = PRESERVE_OWNERSHIP_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe {
-            std::env::remove_var(openshell_core::sandbox_env::SANDBOX_UID);
-            std::env::remove_var(openshell_core::sandbox_env::PRESERVE_SANDBOX_OWNERSHIP);
-        }
-        assert!(!should_recursively_chown_sandbox_home());
     }
 }
