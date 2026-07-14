@@ -226,6 +226,16 @@ default `/sandbox` workspace PVC injection for that sandbox. Only the explicit
 mount paths persist through the external PVC; other `/sandbox` paths come from
 the current sandbox image.
 
+To attach a pre-existing claim as the full `/sandbox` workspace (omit
+`volumeClaimTemplates`; sandbox delete does not delete the claim):
+
+```shell
+openshell sandbox create --workspace-pvc workspace-hermes-20gi
+# equivalent:
+openshell sandbox create \
+  --driver-config-json '{"kubernetes":{"workspace_pvc":"workspace-hermes-20gi"}}'
+```
+
 ```shell
 openshell sandbox create \
   --driver-config-json '{

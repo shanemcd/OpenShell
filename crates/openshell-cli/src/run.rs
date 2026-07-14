@@ -319,6 +319,52 @@ fn parse_driver_config_json(value: &str) -> Result<prost_types::Struct> {
         .wrap_err("--driver-config-json contains a value that cannot be represented")
 }
 
+/// Merge `--workspace-pvc` into `--driver-config-json` as
+/// `{"kubernetes":{"workspace_pvc":"<claim>"}}`.
+///
+/// Returns owned JSON when either input is set; `None` when both are absent.
+pub fn merge_workspace_pvc_into_driver_config(
+    driver_config_json: Option<&str>,
+    workspace_pvc: Option<&str>,
+) -> Result<Option<String>> {
+    let claim = workspace_pvc.map(str::trim).filter(|s| !s.is_empty());
+    if claim.is_none() {
+        return Ok(driver_config_json.map(str::to_string));
+    }
+    let claim = claim.expect("checked above");
+
+    let mut root = match driver_config_json {
+        Some(raw) => {
+            let parsed: serde_json::Value = serde_json::from_str(raw)
+                .into_diagnostic()
+                .wrap_err("--driver-config-json must be valid JSON")?;
+            match parsed {
+                serde_json::Value::Object(map) => map,
+                _ => {
+                    return Err(miette!(
+                        "--driver-config-json must be a JSON object keyed by driver name"
+                    ));
+                }
+            }
+        }
+        None => serde_json::Map::new(),
+    };
+
+    let k8s = root
+        .entry("kubernetes".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(k8s_obj) = k8s.as_object_mut() else {
+        return Err(miette!(
+            "--driver-config-json kubernetes block must be a JSON object"
+        ));
+    };
+    k8s_obj.insert(
+        "workspace_pvc".to_string(),
+        serde_json::Value::String(claim.to_string()),
+    );
+
+    Ok(Some(serde_json::Value::Object(root).to_string()))
+
 fn validate_cpu_quantity(value: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -6297,6 +6343,34 @@ mod tests {
             .expect("pod block should be a struct");
 
         assert!(pod.fields.contains_key("node_selector"));
+    }
+
+    #[test]
+    fn merge_workspace_pvc_into_driver_config_sets_kubernetes_field() {
+        let merged = merge_workspace_pvc_into_driver_config(None, Some("workspace-hermes-20gi"))
+            .expect("merge")
+            .expect("json");
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(
+            value["kubernetes"]["workspace_pvc"],
+            "workspace-hermes-20gi"
+        );
+    }
+
+    #[test]
+    fn merge_workspace_pvc_preserves_existing_driver_config() {
+        let merged = merge_workspace_pvc_into_driver_config(
+            Some(r#"{"kubernetes":{"pod":{"runtime_class_name":"kata"}}}"#),
+            Some("existing-claim"),
+        )
+        .expect("merge")
+        .expect("json");
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(value["kubernetes"]["workspace_pvc"], "existing-claim");
+        assert_eq!(
+            value["kubernetes"]["pod"]["runtime_class_name"],
+            "kata"
+        );
     }
 
     #[test]

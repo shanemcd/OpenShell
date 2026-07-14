@@ -147,6 +147,10 @@ struct KubernetesSandboxDriverConfig {
     pod: KubernetesPodDriverConfig,
     containers: KubernetesDriverContainersConfig,
     volumes: Vec<KubernetesDriverVolumeConfig>,
+    /// Existing PVC claim name to attach at `/sandbox` instead of creating a
+    /// `volumeClaimTemplates` workspace PVC. Claim must already exist; sandbox
+    /// delete does not delete it.
+    workspace_pvc: String,
 }
 
 impl KubernetesSandboxDriverConfig {
@@ -1518,6 +1522,17 @@ impl KubernetesComputeDriver {
             .map(KubernetesComputeConfig::image_pull_policy_value)
             .transpose()
             .map_err(KubernetesDriverError::Precondition)?;
+        // Named workspace PVC from per-sandbox kubernetes driver_config (CLI
+        // `--workspace-pvc` / `{"kubernetes":{"workspace_pvc":"..."}}`).
+        let workspace_pvc_owned = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+            .and_then(|template| KubernetesSandboxDriverConfig::from_template(template).ok())
+            .map(|cfg| cfg.workspace_pvc)
+            .filter(|claim| !claim.is_empty());
+        let workspace_pvc = workspace_pvc_owned.as_deref().unwrap_or("");
+
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
             image_pull_policy,
@@ -1549,6 +1564,7 @@ impl KubernetesComputeDriver {
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
             workspace_storage_class: &self.config.workspace_storage_class,
             workspace_persistence: self.config.workspace_persistence,
+            workspace_pvc,
             default_runtime_class_name: &self.config.default_runtime_class_name,
             sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
             provider_spiffe_enabled: self.config.provider_spiffe_enabled(),
@@ -3381,6 +3397,61 @@ fn apply_supervisor_sidecar_topology(
     ));
 }
 
+/// Attach an existing PVC at `/sandbox` without `volumeClaimTemplates` or the
+/// workspace-init seed container. Used for `--workspace-pvc` / named passthrough.
+fn apply_named_workspace_pvc(pod_template: &mut serde_json::Value, claim_name: &str) {
+    let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+
+    let containers = spec.get_mut("containers").and_then(|v| v.as_array_mut());
+    if let Some(containers) = containers {
+        let mut target_index = None;
+        for (i, c) in containers.iter().enumerate() {
+            if c.get("name").and_then(|v| v.as_str()) == Some("agent") {
+                target_index = Some(i);
+                break;
+            }
+        }
+        let index = target_index.unwrap_or(0);
+        if let Some(container) = containers.get_mut(index).and_then(|v| v.as_object_mut()) {
+            let volume_mounts = container
+                .entry("volumeMounts")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut();
+            if let Some(volume_mounts) = volume_mounts {
+                let already = volume_mounts.iter().any(|m| {
+                    m.get("name").and_then(|v| v.as_str()) == Some(WORKSPACE_VOLUME_NAME)
+                });
+                if !already {
+                    volume_mounts.push(serde_json::json!({
+                        "name": WORKSPACE_VOLUME_NAME,
+                        "mountPath": WORKSPACE_MOUNT_PATH
+                    }));
+                }
+            }
+        }
+    }
+
+    let volumes = spec
+        .entry("volumes")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut();
+    if let Some(volumes) = volumes {
+        let already = volumes
+            .iter()
+            .any(|v| v.get("name").and_then(|n| n.as_str()) == Some(WORKSPACE_VOLUME_NAME));
+        if !already {
+            volumes.push(serde_json::json!({
+                "name": WORKSPACE_VOLUME_NAME,
+                "persistentVolumeClaim": {
+                    "claimName": claim_name
+                }
+            }));
+        }
+    }
+}
+
 /// Apply workspace persistence transforms to an already-built pod template.
 ///
 /// This injects:
@@ -3565,6 +3636,9 @@ struct SandboxPodParams<'a> {
     workspace_storage_class: &'a str,
     /// When true, emit a workspace PVC + `/sandbox` mount (Pod and VM).
     workspace_persistence: bool,
+    /// Existing PVC claim name for `/sandbox`. When non-empty, omit
+    /// `volumeClaimTemplates` and attach this claim via podTemplate volumes.
+    workspace_pvc: &'a str,
     default_runtime_class_name: &'a str,
     /// Lifetime (seconds) of the projected `ServiceAccount` token used
     /// for the bootstrap `IssueSandboxToken` exchange.
@@ -3611,6 +3685,7 @@ impl Default for SandboxPodParams<'_> {
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
             workspace_storage_class: "",
             workspace_persistence: true,
+            workspace_pvc: "",
             default_runtime_class_name: "",
             sa_token_ttl_secs: 3600,
             provider_spiffe_enabled: false,
@@ -3682,12 +3757,15 @@ fn sandbox_to_k8s_spec(
 
     // Determine early whether OpenShell should inject its default workspace
     // PVC. Explicit Kubernetes driver-config mounts under /sandbox/ take
-    // ownership of workspace persistence. The config flag can disable injection.
+    // ownership of workspace persistence. A named workspace_pvc claim does
+    // too (passthrough — no VCT). The config flag can disable injection.
     // We need this flag before building the podTemplate because the workspace
     // persistence transforms are applied inside sandbox_template_to_k8s.
     let user_has_explicit_workspace_mount = driver_config.has_explicit_sandbox_data_mount();
-    let inject_workspace =
-        params.workspace_persistence && !user_has_explicit_workspace_mount;
+    let named_workspace_pvc = !params.workspace_pvc.is_empty();
+    let inject_workspace = params.workspace_persistence
+        && !user_has_explicit_workspace_mount
+        && !named_workspace_pvc;
 
     if let Some(spec) = spec {
         let pod_env = spec_pod_env(Some(spec));
@@ -3738,6 +3816,12 @@ fn sandbox_to_k8s_spec(
                 params,
             ),
         );
+    }
+
+    if named_workspace_pvc {
+        if let Some(pod_template) = root.get_mut("podTemplate") {
+            apply_named_workspace_pvc(pod_template, params.workspace_pvc);
+        }
     }
 
     Ok(serde_json::Value::Object(
@@ -3828,7 +3912,7 @@ fn sandbox_to_k8s_spec_vm(
             "readOnly": true
         }));
     }
-    if params.workspace_persistence {
+    if params.workspace_persistence || !params.workspace_pvc.is_empty() {
         volume_mounts.push(serde_json::json!({
             "name": WORKSPACE_VOLUME_NAME,
             "mountPath": WORKSPACE_MOUNT_PATH
@@ -3860,6 +3944,14 @@ fn sandbox_to_k8s_spec_vm(
             }
         }));
     }
+    if !params.workspace_pvc.is_empty() {
+        volumes.push(serde_json::json!({
+            "name": WORKSPACE_VOLUME_NAME,
+            "persistentVolumeClaim": {
+                "claimName": params.workspace_pvc
+            }
+        }));
+    }
 
     let mut pod_spec = serde_json::json!({
         "containers": [container],
@@ -3882,7 +3974,9 @@ fn sandbox_to_k8s_spec_vm(
     let mut root = serde_json::Map::new();
     root.insert("runtimeBackend".to_string(), serde_json::json!("VirtualMachine"));
     root.insert("podTemplate".to_string(), pod_template);
-    if params.workspace_persistence {
+    // Named PVC passthrough wins: omit VCT so the controller does not create
+    // workspace-<sandbox> or ownerRef the passthrough claim.
+    if params.workspace_persistence && params.workspace_pvc.is_empty() {
         root.insert(
             "volumeClaimTemplates".to_string(),
             default_workspace_volume_claim_templates(
@@ -8639,6 +8733,69 @@ mod tests {
             m["name"] == WORKSPACE_VOLUME_NAME && m["mountPath"] == WORKSPACE_MOUNT_PATH
         }));
         // VMs must not get the Pod workspace-init container.
+        assert!(cr["spec"]["podTemplate"]["spec"]
+            .get("initContainers")
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true));
+    }
+
+    #[test]
+    fn vm_spec_named_workspace_pvc_omits_vct_and_emits_volume() {
+        let params = SandboxPodParams {
+            runtime_backend: "VirtualMachine",
+            default_image: "registry.example/hermes:latest",
+            workspace_persistence: true,
+            workspace_pvc: "workspace-hermes-20gi",
+            sandbox_name: "hermes",
+            ..SandboxPodParams::default()
+        };
+        let cr = sandbox_to_k8s_spec(None, &params).expect("vm spec");
+        assert!(
+            cr["spec"].get("volumeClaimTemplates").is_none(),
+            "named workspace_pvc must omit volumeClaimTemplates"
+        );
+        let mounts = cr["spec"]["podTemplate"]["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts");
+        assert!(mounts.iter().any(|m| {
+            m["name"] == WORKSPACE_VOLUME_NAME && m["mountPath"] == WORKSPACE_MOUNT_PATH
+        }));
+        let volumes = cr["spec"]["podTemplate"]["spec"]["volumes"]
+            .as_array()
+            .expect("volumes");
+        let workspace = volumes
+            .iter()
+            .find(|v| v["name"] == WORKSPACE_VOLUME_NAME)
+            .expect("workspace volume");
+        assert_eq!(
+            workspace["persistentVolumeClaim"]["claimName"],
+            "workspace-hermes-20gi"
+        );
+    }
+
+    #[test]
+    fn pod_spec_named_workspace_pvc_omits_vct_and_emits_volume() {
+        let params = SandboxPodParams {
+            workspace_persistence: true,
+            workspace_pvc: "workspace-existing",
+            sandbox_name: "demo",
+            ..SandboxPodParams::default()
+        };
+        let cr = sandbox_to_k8s_spec(None, &params).expect("pod spec");
+        assert!(cr["spec"].get("volumeClaimTemplates").is_none());
+        let volumes = cr["spec"]["podTemplate"]["spec"]["volumes"]
+            .as_array()
+            .expect("volumes");
+        let workspace = volumes
+            .iter()
+            .find(|v| v["name"] == WORKSPACE_VOLUME_NAME)
+            .expect("workspace volume");
+        assert_eq!(
+            workspace["persistentVolumeClaim"]["claimName"],
+            "workspace-existing"
+        );
+        // No workspace-init seed for passthrough claims.
         assert!(cr["spec"]["podTemplate"]["spec"]
             .get("initContainers")
             .and_then(|v| v.as_array())

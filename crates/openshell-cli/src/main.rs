@@ -1344,6 +1344,14 @@ enum SandboxCommands {
         #[arg(long, value_name = "JSON")]
         driver_config_json: Option<String>,
 
+        /// Attach an existing Kubernetes PVC at `/sandbox` instead of creating
+        /// a workspace volumeClaimTemplate. The claim must already exist;
+        /// deleting the sandbox does not delete the PVC.
+        ///
+        /// Wired as `{"kubernetes":{"workspace_pvc":"<claim>"}}` in driver config.
+        #[arg(long, value_name = "CLAIM")]
+        workspace_pvc: Option<String>,
+
         /// Attach a configured credential provider to the sandbox.
         /// Use providers for API keys, tokens, and other secrets so commands in
         /// the sandbox do not receive the real credential values. Repeatable.
@@ -3057,6 +3065,7 @@ async fn run_async() -> Result<()> {
                     cpu,
                     memory,
                     driver_config_json,
+                    workspace_pvc,
                     providers,
                     policy,
                     forward,
@@ -3131,6 +3140,11 @@ async fn run_async() -> Result<()> {
                     let keep = keep || !no_keep || editor.is_some() || forward.is_some();
                     let gpu_requirements: Option<GpuResourceRequirements> = gpu.map(Into::into);
 
+                    let merged_driver_config = run::merge_workspace_pvc_into_driver_config(
+                        driver_config_json.as_deref(),
+                        workspace_pvc.as_deref(),
+                    )?;
+
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
@@ -3147,7 +3161,7 @@ async fn run_async() -> Result<()> {
                             gpu_requirements,
                             cpu: cpu.as_deref(),
                             memory: memory.as_deref(),
-                            driver_config_json: driver_config_json.as_deref(),
+                            driver_config_json: merged_driver_config.as_deref(),
                             editor,
                             providers: &providers,
                             policy: policy.as_deref(),
