@@ -364,6 +364,7 @@ pub fn merge_workspace_pvc_into_driver_config(
     );
 
     Ok(Some(serde_json::Value::Object(root).to_string()))
+}
 
 fn validate_cpu_quantity(value: &str) -> Result<String> {
     let value = value.trim();
