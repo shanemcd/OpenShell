@@ -1554,6 +1554,7 @@ impl KubernetesComputeDriver {
             proxy_connect_by_hostname: self.config.proxy_connect_by_hostname == Some(true),
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
+            workspace: &sandbox.workspace,
             sandbox_name: &sandbox.name,
             grpc_endpoint: &self.config.grpc_endpoint,
             ssh_socket_path: self.ssh_socket_path(),
@@ -3625,6 +3626,8 @@ struct SandboxPodParams<'a> {
     proxy_connect_by_hostname: bool,
     service_account_name: &'a str,
     sandbox_id: &'a str,
+    /// OpenShell workspace (maps into the Kubernetes Sandbox CR name prefix).
+    workspace: &'a str,
     sandbox_name: &'a str,
     grpc_endpoint: &'a str,
     ssh_socket_path: &'a str,
@@ -3675,6 +3678,7 @@ impl Default for SandboxPodParams<'_> {
             proxy_connect_by_hostname: false,
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
+            workspace: "default",
             sandbox_name: "",
             grpc_endpoint: "",
             ssh_socket_path: "",
@@ -3835,10 +3839,11 @@ fn sandbox_to_k8s_spec(
 /// and passes all container env vars into the VM via a Secret virtio disk.
 /// The VM image has the supervisor baked in; guest prepare scripts mount disks
 /// and bootstrap the supervisor. Auth uses the same `IssueSandboxToken` path
-/// as Pods: a Secret volume (`{sandbox}-openshell-sa-token`) holds a rotating
-/// BoundObjectRef SA JWT minted by agent-sandbox against a companion bootstrap
-/// Pod. When `workspace_persistence` is enabled, a workspace PVC is attached
-/// the same way as for Pods.
+/// as Pods: a Secret volume (`{workspace}--{sandbox}-openshell-sa-token`) holds
+/// a rotating BoundObjectRef SA JWT minted by agent-sandbox against a companion
+/// bootstrap Pod (agent-sandbox names the Secret from the Sandbox CR name).
+/// When `workspace_persistence` is enabled, a workspace PVC is attached the
+/// same way as for Pods.
 fn sandbox_to_k8s_spec_vm(
     spec: Option<&SandboxSpec>,
     params: &SandboxPodParams<'_>,
@@ -3926,7 +3931,12 @@ fn sandbox_to_k8s_spec_vm(
         "volumeMounts": volume_mounts
     });
 
-    let sa_secret_name = format!("{}-openshell-sa-token", params.sandbox_name);
+    // Must match agent-sandbox: Secret name is derived from the Sandbox CR
+    // name (`{workspace}--{sandbox}`), not the bare OpenShell sandbox name.
+    let sa_secret_name = format!(
+        "{}-openshell-sa-token",
+        kube_resource_name(params.workspace, params.sandbox_name)
+    );
     let mut volumes = vec![serde_json::json!({
         "name": SERVICE_ACCOUNT_TOKEN_VOLUME_NAME,
         "secret": {
@@ -8860,12 +8870,31 @@ mod tests {
             .expect("volumes");
         assert!(volumes.iter().any(|v| {
             v["name"] == SERVICE_ACCOUNT_TOKEN_VOLUME_NAME
-                && v["secret"]["secretName"] == "hermes-openshell-sa-token"
+                && v["secret"]["secretName"] == "default--hermes-openshell-sa-token"
         }));
         assert_eq!(
             cr["spec"]["podTemplate"]["metadata"]["annotations"]["openshell.io/sandbox-id"],
             "sb-id-1"
         );
+    }
+
+    #[test]
+    fn vm_spec_sa_token_secret_uses_workspace_prefix() {
+        let params = SandboxPodParams {
+            runtime_backend: "VirtualMachine",
+            workspace: "team-a",
+            sandbox_name: "hermes",
+            workspace_persistence: false,
+            ..SandboxPodParams::default()
+        };
+        let cr = sandbox_to_k8s_spec(None, &params).expect("vm spec");
+        let volumes = cr["spec"]["podTemplate"]["spec"]["volumes"]
+            .as_array()
+            .expect("volumes");
+        assert!(volumes.iter().any(|v| {
+            v["name"] == SERVICE_ACCOUNT_TOKEN_VOLUME_NAME
+                && v["secret"]["secretName"] == "team-a--hermes-openshell-sa-token"
+        }));
     }
 
     #[test]
