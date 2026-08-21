@@ -257,6 +257,16 @@ pub const ENTRYPOINT_PID_FILE: &str = "OPENSHELL_ENTRYPOINT_PID_FILE";
 /// for sibling workloads (`nsenter --net=...`). Default `/run/openshell/netns`.
 pub const NETNS_FILE: &str = "OPENSHELL_NETNS_FILE";
 
+/// When set to `"1"`, skip the recursive `/sandbox` chown in
+/// `prepare_filesystem`.
+///
+/// Used by KubeVirt / NemoClaw guests that seal trust anchors under
+/// root-owned paths (for example `root:sandbox` Hermes config dirs).
+pub const PRESERVE_SANDBOX_OWNERSHIP: &str = "OPENSHELL_PRESERVE_SANDBOX_OWNERSHIP";
+
+/// Default command for VM sandboxes (for example `/usr/local/bin/nemoclaw-start-vm`).
+pub const SANDBOX_COMMAND: &str = "OPENSHELL_SANDBOX_COMMAND";
+
 // The corporate upstream-proxy configuration deliberately has no reserved
 // environment variables: it travels on the supervisor's argv
 // (`--upstream-proxy` and friends), which a sandbox image cannot forge the
