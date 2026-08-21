@@ -61,6 +61,15 @@ fn apply_kubernetes_runtime_defaults(k8s: &mut KubernetesComputeConfig) {
             _ => {}
         }
     }
+    if let Ok(class_name) = std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME") {
+        k8s.default_runtime_class_name = class_name;
+    }
+    if let Ok(runtime_backend) = std::env::var("OPENSHELL_K8S_RUNTIME_BACKEND") {
+        k8s.runtime_backend = runtime_backend;
+    }
+    if let Ok(sandbox_command) = std::env::var("OPENSHELL_K8S_SANDBOX_COMMAND") {
+        k8s.sandbox_command = sandbox_command;
+    }
 }
 
 fn apply_podman_runtime_defaults(
