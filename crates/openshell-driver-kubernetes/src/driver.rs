@@ -4694,6 +4694,10 @@ fn validate_gpu_request(
 
 const MAX_KUBE_NAME_LEN: usize = 63;
 
+fn kube_resource_name(workspace: &str, name: &str) -> String {
+    format!("{workspace}--{name}")
+}
+
 fn validate_kube_resource_name_length(workspace: &str, name: &str) -> Result<(), tonic::Status> {
     let combined = workspace.len() + 2 + name.len(); // "--" separator
     if combined > MAX_KUBE_NAME_LEN {
@@ -11504,8 +11508,11 @@ fn upstream_proxy_is_injected_only_into_network_supervisors() {
                 .get("app.kubernetes.io/name")
                 .map(String::as_str),
             Some("openshell")
+        );
+    }
 
-fn vm_spec_mounts_client_tls_secret_when_configured() {
+    #[test]
+    fn vm_spec_mounts_client_tls_secret_when_configured() {
         let params = SandboxPodParams {
             runtime_backend: "VirtualMachine",
             client_tls_secret_name: "openshell-client-tls",
@@ -11945,8 +11952,11 @@ fn vm_spec_mounts_client_tls_secret_when_configured() {
         assert_ne!(
             namespace_watcher_retry_delay(3, 1),
             namespace_watcher_retry_delay(3, 2)
+        );
+    }
 
-fn pod_spec_omits_workspace_pvc_when_persistence_disabled() {
+    #[test]
+    fn pod_spec_omits_workspace_pvc_when_persistence_disabled() {
         let params = SandboxPodParams {
             workspace_persistence: false,
             ..SandboxPodParams::default()
