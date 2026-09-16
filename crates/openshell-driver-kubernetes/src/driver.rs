@@ -1727,15 +1727,13 @@ impl KubernetesComputeDriver {
         let image_pull_policy = self
             .config
             .image_pull_policy
-            .as_ref()
-            .map(|p| p.to_string())
+            .map(|p| p.as_kubernetes_str().to_string())
             .transpose()
             .map_err(KubernetesDriverError::Precondition)?;
         let supervisor_image_pull_policy = self
             .config
             .supervisor_image_pull_policy
-            .as_ref()
-            .map(|p| p.to_string())
+            .map(|p| p.as_kubernetes_str().to_string())
             .transpose()
             .map_err(KubernetesDriverError::Precondition)?;
         // Named workspace PVC from per-sandbox kubernetes driver_config (CLI
