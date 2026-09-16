@@ -1940,7 +1940,6 @@ let image_pull_policy = self
             .map(|cfg| cfg.workspace_pvc)
             .filter(|claim| !claim.is_empty());
         let workspace_pvc = workspace_pvc_owned.as_deref().unwrap_or("");
- 1fdd5d65 (Add --workspace-pvc for named Kubernetes workspace claim passthrough.)
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
             image_pull_policy: self.config.image_pull_policy,
@@ -1966,7 +1965,6 @@ workspace: &sandbox.workspace,
             sandbox_gid: resolved_group_id,
 runtime_backend: &self.config.runtime_backend,
             sandbox_command: &self.config.sandbox_command,
- 50fb5e25 (Add thin VirtualMachine runtime backend for Kubernetes sandboxes.)
         };
         let kube_name = self.config.kube_resource_name(workspace, name);
         let mut data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
@@ -6283,7 +6281,6 @@ struct SandboxPodParams<'a> {
     runtime_backend: &'a str,
     /// Default command for VM sandboxes.
     sandbox_command: &'a str,
- 50fb5e25 (Add thin VirtualMachine runtime backend for Kubernetes sandboxes.)
 }
 
 impl Default for SandboxPodParams<'_> {
@@ -6313,7 +6310,6 @@ workspace: "default",
             sandbox_gid: DEFAULT_SANDBOX_UID,
 runtime_backend: "",
             sandbox_command: "",
- 50fb5e25 (Add thin VirtualMachine runtime backend for Kubernetes sandboxes.)
         }
     }
 }
@@ -6354,7 +6350,6 @@ if params.runtime_backend.eq_ignore_ascii_case("VirtualMachine") {
 
     let driver_config =
         kubernetes_driver_config_for_spec(spec, provider_spiffe_socket_path(params))?;
- 50fb5e25 (Add thin VirtualMachine runtime backend for Kubernetes sandboxes.)
     let mut root = serde_json::Map::new();
 
     // Determine early whether OpenShell should inject its default workspace
@@ -11587,7 +11582,6 @@ fn upstream_proxy_is_injected_only_into_network_supervisors() {
     }
 
     #[test]
- 50fb5e25 (Add thin VirtualMachine runtime backend for Kubernetes sandboxes.)
     fn sandbox_lookup_selector_always_includes_gateway_id() {
         let sel = sandbox_lookup_selector_for("sb-123", "gw-42");
         assert!(
