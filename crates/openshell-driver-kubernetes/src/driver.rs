@@ -6204,7 +6204,7 @@ if params.runtime_backend.eq_ignore_ascii_case("VirtualMachine") {
     }
 
     let driver_config =
-        kubernetes_driver_config_for_spec(spec)?;?;
+        kubernetes_driver_config_for_spec(spec)?;
     let mut root = serde_json::Map::new();
 
     // Determine early whether OpenShell should inject its default workspace
