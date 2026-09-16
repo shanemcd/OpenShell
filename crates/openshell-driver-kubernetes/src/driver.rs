@@ -1715,6 +1715,15 @@ impl KubernetesComputeDriver {
             .resolve_sandbox_identity_in_namespace(&target_namespace)
             .await;
 
+        let generation = random_sandbox_runtime_token();
+        let proxy_names = SandboxRuntimeNames::for_generation(&sandbox.id, &generation);
+        let main_process_spec = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(
+            sandbox.spec.as_ref(),
+        )
+        .map_err(|error| {
+            KubernetesDriverError::InvalidArgument(format!("encode main process spec: {error}"))
+        })?;
+        let log_level = openshell_core::driver_utils::sandbox_log_level(sandbox, "info");
 let image_pull_policy = self
             .config
             .image_pull_policy
