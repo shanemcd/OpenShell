@@ -1848,7 +1848,7 @@ impl KubernetesComputeDriver {
             KubernetesDriverError::InvalidArgument(format!("encode main process spec: {error}"))
         })?;
         let log_level = openshell_core::driver_utils::sandbox_log_level(sandbox, "info");
-let image_pull_policy = self
+        let image_pull_policy = self
             .config
             .image_pull_policy
             .map(KubernetesComputeConfig::image_pull_policy_value)
@@ -6204,7 +6204,7 @@ if params.runtime_backend.eq_ignore_ascii_case("VirtualMachine") {
     }
 
     let driver_config =
-        kubernetes_driver_config_for_spec(spec, provider_spiffe_socket_path(params))?;
+        kubernetes_driver_config_for_spec(spec)?;?;
     let mut root = serde_json::Map::new();
 
     // Determine early whether OpenShell should inject its default workspace
