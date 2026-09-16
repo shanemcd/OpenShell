@@ -94,6 +94,17 @@ pub enum SupervisorSideloadMethod {
     /// Works on all Kubernetes versions.
     InitContainer,
 }
+/// Driver-owned requirements for the Kubernetes sandbox runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesSandboxRuntimeConfig {
+    /// Explicit operator assertion that the cluster CNI enforces
+    /// `networking.k8s.io/v1` `NetworkPolicy` for the sandbox namespaces.
+    pub network_policy_enforced: bool,
+    /// TCP port exposed by the workload boundary to its paired control pod.
+    pub boundary_port: u16,
+}
+
 
 impl Default for KubernetesSandboxRuntimeConfig {
     fn default() -> Self {
