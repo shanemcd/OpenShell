@@ -220,7 +220,6 @@ data:
     {{- if .Values.server.sandboxCommand }}
     sandbox_command              = {{ .Values.server.sandboxCommand | quote }}
     {{- end }}
- 50fb5e25 (Add thin VirtualMachine runtime backend for Kubernetes sandboxes.)
     {{- if (.Values.supervisor.image.pullPolicy | default .Values.global.image.pullPolicy) }}
     supervisor_image_pull_policy = {{ include "openshell.canonicalImagePullPolicy" (.Values.supervisor.image.pullPolicy | default .Values.global.image.pullPolicy) | quote }}
     {{- end }}

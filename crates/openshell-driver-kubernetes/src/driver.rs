@@ -1875,7 +1875,6 @@ workspace: &sandbox.workspace,
             ssh_socket_path: self.ssh_socket_path(),
             client_tls_secret_name: &self.config.client_tls_secret_name,
             host_gateway_ip: &self.config.host_gateway_ip,
- 83a31282 (fix(k8s): mount VM SA token Secret by workspace-prefixed CR name)
             enable_user_namespaces: self.config.enable_user_namespaces,
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
             workspace_storage_class: &self.config.workspace_storage_class,
@@ -6112,7 +6111,6 @@ struct SandboxPodParams<'a> {
     ssh_socket_path: &'a str,
     client_tls_secret_name: &'a str,
     host_gateway_ip: &'a str,
- 83a31282 (fix(k8s): mount VM SA token Secret by workspace-prefixed CR name)
     enable_user_namespaces: bool,
     workspace_default_storage_size: &'a str,
     workspace_storage_class: &'a str,
@@ -6148,7 +6146,6 @@ workspace: "default",
             ssh_socket_path: "",
             client_tls_secret_name: "",
             host_gateway_ip: "",
- 83a31282 (fix(k8s): mount VM SA token Secret by workspace-prefixed CR name)
             enable_user_namespaces: false,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
             workspace_storage_class: "",

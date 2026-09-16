@@ -132,7 +132,6 @@ pub fn should_drop_privileges_before_exec() -> bool {
         _ => true,
     }
 }
- de45cc60 (Defer sandbox entrypoint privilege drop for root self-seal guests.):crates/openshell-supervisor-process/src/process.rs
 #[cfg(target_os = "linux")]
 pub(crate) fn prepare_child_sandbox(
     policy: &SandboxPolicy,
@@ -673,7 +672,6 @@ impl ProcessHandle {
                         drop_privileges_with_identity(&policy, resolved_identity)
                             .map_err(|err| std::io::Error::other(err.to_string()))?;
                     }
- de45cc60 (Defer sandbox entrypoint privilege drop for root self-seal guests.):crates/openshell-supervisor-process/src/process.rs
                     harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
 
                     // Phase 2: Enforce the prepared Landlock ruleset via
@@ -837,7 +835,6 @@ impl ProcessHandle {
                         drop_privileges_with_identity(&policy, resolved_identity)
                             .map_err(|err| std::io::Error::other(err.to_string()))?;
                     }
- de45cc60 (Defer sandbox entrypoint privilege drop for root self-seal guests.):crates/openshell-supervisor-process/src/process.rs
                     harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
                     sandbox::apply(&policy, workdir.as_deref())
                         .map_err(|err| std::io::Error::other(err.to_string()))?;
@@ -2496,7 +2493,6 @@ mod tests {
             assert!(should_drop_privileges_before_exec());
         });
     }
- de45cc60 (Defer sandbox entrypoint privilege drop for root self-seal guests.):crates/openshell-supervisor-process/src/process.rs
     #[cfg(target_os = "linux")]
     fn capability_bounding_set_clear_available() -> bool {
         capctl::caps::CapState::get_current()
