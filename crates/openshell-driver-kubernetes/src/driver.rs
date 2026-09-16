@@ -1727,13 +1727,15 @@ impl KubernetesComputeDriver {
         let image_pull_policy = self
             .config
             .image_pull_policy
-            .map(KubernetesComputeConfig::image_pull_policy_value)
+            .as_ref()
+            .map(|p| p.to_string())
             .transpose()
             .map_err(KubernetesDriverError::Precondition)?;
         let supervisor_image_pull_policy = self
             .config
             .supervisor_image_pull_policy
-            .map(KubernetesComputeConfig::image_pull_policy_value)
+            .as_ref()
+            .map(|p| p.to_string())
             .transpose()
             .map_err(KubernetesDriverError::Precondition)?;
         // Named workspace PVC from per-sandbox kubernetes driver_config (CLI
@@ -1768,6 +1770,8 @@ workspace: &sandbox.workspace,
             default_runtime_class_name: &self.config.default_runtime_class_name,
             sandbox_uid: resolved_user_id,
             sandbox_gid: resolved_group_id,
+            boundary_port: self.config.sandbox_runtime.boundary_port,
+            sandbox_secret_name: &generation,
 runtime_backend: &self.config.runtime_backend,
             sandbox_command: &self.config.sandbox_command,
         };
@@ -5816,7 +5820,11 @@ struct SandboxPodParams<'a> {
     sandbox_uid: u32,
     /// Resolved sandbox GID for PVC init container operations.
     sandbox_gid: u32,
-/// Runtime backend: empty or "Pod" for pods, "VirtualMachine" for KubeVirt VMs.
+    /// TLS listener port exposed only to the paired supervisor Pod.
+    boundary_port: u16,
+    /// Immutable Secret name for this workload Pod generation.
+    sandbox_secret_name: &'a str,
+    /// Runtime backend: empty or "Pod" for pods, "VirtualMachine" for KubeVirt VMs.
     runtime_backend: &'a str,
     /// Default command for VM sandboxes.
     sandbox_command: &'a str,
@@ -5846,6 +5854,8 @@ workspace: "default",
             default_runtime_class_name: "",
             sandbox_uid: DEFAULT_SANDBOX_UID,
             sandbox_gid: DEFAULT_SANDBOX_UID,
+            boundary_port: 0,
+            sandbox_secret_name: "",
 runtime_backend: "",
             sandbox_command: "",
         }
