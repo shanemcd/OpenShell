@@ -93,7 +93,6 @@ pub enum SupervisorSideloadMethod {
     /// Copy the binary via an init container and emptyDir volume.
     /// Works on all Kubernetes versions.
     InitContainer,
- 50fb5e25 (Add thin VirtualMachine runtime backend for Kubernetes sandboxes.)
 }
 
 impl Default for KubernetesSandboxRuntimeConfig {
@@ -320,7 +319,6 @@ pub struct KubernetesComputeConfig {
     /// create network namespaces and configure Landlock/seccomp; the
     /// `sandbox_uid` is injected as the `SANDBOX_UID` environment variable so
     /// the supervisor knows which UID to drop to for child processes.
- 50fb5e25 (Add thin VirtualMachine runtime backend for Kubernetes sandboxes.)
     /// When empty, the driver auto-detects from `OpenShift` SCC annotations on
     /// the target namespace; if those are also absent, falls back to `10001`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

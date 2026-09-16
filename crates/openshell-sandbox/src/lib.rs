@@ -6340,5 +6340,4 @@ network_policies:
                 .contains("previous policy IS active")
         );
     }
- 65def282 (Watch sibling entrypoint.pid for network-only L7 identity.)
 }
