@@ -1841,6 +1841,7 @@ impl KubernetesComputeDriver {
 
         let generation = random_sandbox_runtime_token();
         let proxy_names = SandboxRuntimeNames::for_generation(&sandbox.id, &generation);
+        let image_pull_secrets = self.generation_image_pull_secret_names(&proxy_names);
         let main_process_spec = openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(
             sandbox.spec.as_ref(),
         )
